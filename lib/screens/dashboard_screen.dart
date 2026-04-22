@@ -16,7 +16,9 @@ class DashboardScreen extends StatelessWidget {
 
     if (plant == null) {
       return const Scaffold(
-        body: Center(child: Text('No active plant profile found')),
+        body: Center(
+          child: Text('No active plant profile found'),
+        ),
       );
     }
 
@@ -29,7 +31,9 @@ class DashboardScreen extends StatelessWidget {
             onPressed: () {
               Navigator.push(
                 context,
-                MaterialPageRoute(builder: (_) => const PlantListScreen()),
+                MaterialPageRoute(
+                  builder: (_) => const PlantListScreen(),
+                ),
               );
             },
           ),
@@ -43,22 +47,79 @@ class DashboardScreen extends StatelessWidget {
                 children: [
                   _statusBanner(status.overallStatus),
                   const SizedBox(height: 16),
+
                   Row(
                     children: [
-                      Expanded(child: _sensorCard('pH', status.ph.toStringAsFixed(2), Colors.blue)),
+                      Expanded(
+                        child: _sensorCard(
+                          'pH',
+                          status.ph.toStringAsFixed(2),
+                          Colors.blue,
+                          Icons.science,
+                        ),
+                      ),
                       const SizedBox(width: 12),
-                      Expanded(child: _sensorCard('Temp', '${status.temperature.toStringAsFixed(1)} °C', Colors.orange)),
+                      Expanded(
+                        child: _sensorCard(
+                          'Temp',
+                          '${status.temperature.toStringAsFixed(1)} °C',
+                          Colors.orange,
+                          Icons.thermostat,
+                        ),
+                      ),
                     ],
                   ),
+
                   const SizedBox(height: 12),
+
                   Row(
                     children: [
-                      Expanded(child: _sensorCard('TDS', '${status.tds.toStringAsFixed(0)} ppm', Colors.green)),
+                      Expanded(
+                        child: _sensorCard(
+                          'TDS',
+                          '${status.tds.toStringAsFixed(0)} ppm',
+                          Colors.green,
+                          Icons.opacity,
+                        ),
+                      ),
                       const SizedBox(width: 12),
-                      Expanded(child: _sensorCard('Watering', 'Every ${plant.wateringCycleHours}h', Colors.purple)),
+                      Expanded(
+                        child: _sensorCard(
+                          'Water Level',
+                          '${status.waterLevel.toStringAsFixed(1)} %',
+                          Colors.teal,
+                          Icons.water,
+                        ),
+                      ),
                     ],
                   ),
+
+                  const SizedBox(height: 12),
+
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _sensorCard(
+                          'Flood State',
+                          status.isFlooding ? 'Flooding' : 'Draining',
+                          status.isFlooding ? Colors.indigo : Colors.grey,
+                          status.isFlooding ? Icons.waves : Icons.water_drop_outlined,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _sensorCard(
+                          'Watering Cycle',
+                          'Every ${plant.wateringCycleHours}h',
+                          Colors.purple,
+                          Icons.schedule,
+                        ),
+                      ),
+                    ],
+                  ),
+
                   const SizedBox(height: 20),
+
                   Align(
                     alignment: Alignment.centerLeft,
                     child: Text(
@@ -66,44 +127,72 @@ class DashboardScreen extends StatelessWidget {
                       style: Theme.of(context).textTheme.titleLarge,
                     ),
                   ),
+
                   const SizedBox(height: 10),
+
                   if (sensorProvider.warnings.isEmpty)
                     _infoBox('No warnings. Conditions are within the optimal range.')
                   else
                     ...sensorProvider.warnings.map((w) => _warningTile(w)),
+
+                  const SizedBox(height: 20),
+
+                  _infoBox(
+                    'Last update: ${status.timestamp.toLocal()}',
+                  ),
                 ],
               ),
             ),
     );
   }
 
-  Widget _sensorCard(String title, String value, Color color) {
+  Widget _sensorCard(String title, String value, Color color, IconData icon) {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.15),
+        color: color.withOpacity(0.14),
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: color),
       ),
       child: Column(
         children: [
-          Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+          Icon(icon, color: color, size: 30),
           const SizedBox(height: 10),
-          Text(value, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          Text(
+            title,
+            style: const TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            value,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 19,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
         ],
       ),
     );
   }
 
   Widget _statusBanner(String status) {
-    final isNormal = status == 'Normal';
+    final isNormal = status.toLowerCase() == 'normal';
+
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: isNormal ? Colors.green.withOpacity(0.15) : Colors.red.withOpacity(0.15),
+        color: isNormal
+            ? Colors.green.withOpacity(0.15)
+            : Colors.red.withOpacity(0.15),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: isNormal ? Colors.green : Colors.red),
+        border: Border.all(
+          color: isNormal ? Colors.green : Colors.red,
+        ),
       ),
       child: Text(
         'System Status: $status',
@@ -120,7 +209,10 @@ class DashboardScreen extends StatelessWidget {
   Widget _warningTile(String text) {
     return Card(
       child: ListTile(
-        leading: const Icon(Icons.warning_amber_rounded, color: Colors.red),
+        leading: const Icon(
+          Icons.warning_amber_rounded,
+          color: Colors.red,
+        ),
         title: Text(text),
       ),
     );
@@ -131,7 +223,7 @@ class DashboardScreen extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: Colors.green.withOpacity(0.12),
+        color: Colors.blueGrey.withOpacity(0.10),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Text(text),

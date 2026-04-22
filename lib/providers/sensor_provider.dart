@@ -1,12 +1,12 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import '../models/plant_profile.dart';
+import 'package:firebase_database/firebase_database.dart';
 import '../models/system_status.dart';
-import '../services/mock_sensor_service.dart';
+import '../services/firebase_service.dart';
 
 class SensorProvider extends ChangeNotifier {
-  final MockSensorService _mockSensorService = MockSensorService();
-  StreamSubscription? _subscription;
+  final FirebaseService _firebaseService = FirebaseService();
+  StreamSubscription<DatabaseEvent>? _subscription;
 
   SystemStatus? _currentStatus;
   SystemStatus? get currentStatus => _currentStatus;
@@ -14,16 +14,41 @@ class SensorProvider extends ChangeNotifier {
   List<String> _warnings = [];
   List<String> get warnings => _warnings;
 
-  PlantProfile? _currentProfile;
-  PlantProfile? get currentProfile => _currentProfile;
-
-  void startListening(PlantProfile profile) {
+  void startListening() {
     _subscription?.cancel();
-    _currentProfile = profile;
 
-    _subscription = _mockSensorService.sensorStream(profile).listen((status) {
-      _currentStatus = status;
-      _warnings = status.warnings;
+    _subscription = _firebaseService.watchSystemStatus().listen((event) {
+      final data = event.snapshot.value;
+
+      if (data == null) {
+        return;
+      }
+
+      final map = Map<String, dynamic>.from(data as Map);
+
+      List<String> warningsList = [];
+
+      final warningsRaw = map['warnings'];
+      if (warningsRaw is Map) {
+        warningsList =
+            warningsRaw.values.map((e) => e.toString()).toList();
+      } else if (warningsRaw is List) {
+        warningsList = warningsRaw.map((e) => e.toString()).toList();
+      }
+
+      _currentStatus = SystemStatus(
+        ph: ((map['ph'] ?? 0) as num).toDouble(),
+        temperature: ((map['temperature'] ?? 0) as num).toDouble(),
+        tds: ((map['tds'] ?? 0) as num).toDouble(),
+        waterLevel: ((map['waterLevel'] ?? 0) as num).toDouble(),
+        isFlooding: (map['isFlooding'] ?? false) as bool,
+        timestamp: DateTime.tryParse(map['timestamp']?.toString() ?? '') ??
+            DateTime.now(),
+        warnings: warningsList,
+        overallStatus: map['overallStatus']?.toString() ?? 'Unknown',
+      );
+
+      _warnings = warningsList;
       notifyListeners();
     });
   }

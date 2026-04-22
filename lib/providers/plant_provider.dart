@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import '../models/plant_profile.dart';
 import '../services/database_service.dart';
+import '../services/firebase_service.dart';
+final FirebaseService _firebaseService = FirebaseService();
 
 class PlantProvider extends ChangeNotifier {
   List<PlantProfile> _plants = [];
@@ -43,11 +45,21 @@ class PlantProvider extends ChangeNotifier {
   Future<void> setActivePlant(int id) async {
     await DatabaseService.instance.setActivePlant(id);
     await loadPlants();
+    final active = activePlant;
+    if (active != null) {
+      print('Uploading active profile: ${active.name}');
+      await _firebaseService.uploadActiveProfile(active);
+  }
   }
 
   Future<void> updatePlant(PlantProfile plant) async {
     await DatabaseService.instance.updatePlant(plant);
     await loadPlants();
+    final active = activePlant;
+    if (active != null) {
+      print('Uploading active profile: ${active.name}');
+      await _firebaseService.uploadActiveProfile(active);
+  }
   }
 
   Future<void> deletePlant(int id) async {
