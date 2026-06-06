@@ -31,7 +31,7 @@ class PlantProvider extends ChangeNotifier {
   bool get hasPlants => _plants.isNotEmpty;
 
   Future<void> loadPlants() async {
-    _log('loadPlants started');
+    _log('START loadPlants');
     _setLoading(true);
     try {
       _plants = await _firebaseService.getPlantProfiles();
@@ -40,20 +40,21 @@ class PlantProvider extends ChangeNotifier {
       if (_plants.isNotEmpty && !_plants.any((p) => p.isActive)) {
         final first = _plants.first;
         if (first.id != null) {
-          _log(
-            'No active profile found; activating first profile id=${first.id}',
-          );
+          _log('No active profile; activating first profile id=${first.id}');
           await _firebaseService.setActiveProfile(first);
-          _plants = await _firebaseService.getPlantProfiles();
-          _log('loadPlants received ${_plants.length} profile(s)');
+          _plants = _plants
+              .map((plant) => plant.id == first.id
+                  ? plant.copyWith(isActive: true)
+                  : plant.copyWith(isActive: false))
+              .toList();
         }
       }
 
       _error = null;
-      _log('loadPlants completed successfully');
+      _log('DONE loadPlants');
       notifyListeners();
     } catch (error, stackTrace) {
-      _log('loadPlants failed: $error');
+      _log('ERROR loadPlants: $error');
       debugPrintStack(stackTrace: stackTrace);
       _error = _friendlyDataMessage('load plant profiles', error);
       notifyListeners();
@@ -63,22 +64,23 @@ class PlantProvider extends ChangeNotifier {
   }
 
   Future<void> addPlant(PlantProfile plant) async {
-    _log(
-      'addPlant started for name=${plant.name} existingCount=${_plants.length}',
-    );
+    _log('START addPlant name=${plant.name} existingCount=${_plants.length}');
     try {
       if (_plants.isEmpty) {
-        _log('addPlant will save and activate first profile');
-        await _firebaseService.savePlantProfileAndActivate(plant);
+        _log('addPlant saving and activating first profile');
+        final id = await _firebaseService.savePlantProfileAndActivate(plant);
+        _plants = [plant.copyWith(id: id, isActive: true)];
       } else {
-        _log('addPlant will save non-active profile');
-        await _firebaseService.savePlantProfile(plant);
+        _log('addPlant saving non-active profile');
+        final id = await _firebaseService.savePlantProfile(plant);
+        _plants = [..._plants, plant.copyWith(id: id, isActive: false)];
       }
 
-      await loadPlants();
-      _log('addPlant completed successfully');
+      _error = null;
+      _log('DONE addPlant localCount=${_plants.length}');
+      notifyListeners();
     } catch (error, stackTrace) {
-      _log('addPlant failed: $error');
+      _log('ERROR addPlant: $error');
       debugPrintStack(stackTrace: stackTrace);
       _error = _friendlyDataMessage('save plant profile', error);
       notifyListeners();
@@ -87,14 +89,18 @@ class PlantProvider extends ChangeNotifier {
   }
 
   Future<void> setActivePlant(String id) async {
-    _log('setActivePlant started for id=$id');
+    _log('START setActivePlant id=$id');
     try {
       final selectedPlant = _plants.firstWhere((plant) => plant.id == id);
       await _firebaseService.setActiveProfile(selectedPlant);
-      await loadPlants();
-      _log('setActivePlant completed for id=$id');
+      _plants = _plants
+          .map((plant) => plant.copyWith(isActive: plant.id == id))
+          .toList();
+      _error = null;
+      _log('DONE setActivePlant id=$id');
+      notifyListeners();
     } catch (error, stackTrace) {
-      _log('setActivePlant failed for id=$id: $error');
+      _log('ERROR setActivePlant id=$id: $error');
       debugPrintStack(stackTrace: stackTrace);
       _error = _friendlyDataMessage('set active plant profile', error);
       notifyListeners();
@@ -103,19 +109,28 @@ class PlantProvider extends ChangeNotifier {
   }
 
   Future<void> updatePlant(PlantProfile plant) async {
-    _log('updatePlant started for id=${plant.id} name=${plant.name}');
+    _log('START updatePlant id=${plant.id} name=${plant.name}');
     try {
       await _firebaseService.savePlantProfile(plant);
-      await loadPlants();
+      final existingIndex = _plants.indexWhere((item) => item.id == plant.id);
+      if (existingIndex == -1) {
+        _plants = [..._plants, plant];
+      } else {
+        final updatedPlants = [..._plants];
+        updatedPlants[existingIndex] = plant;
+        _plants = updatedPlants;
+      }
 
       final active = activePlant;
       if (active != null && active.id == plant.id) {
         await _firebaseService.setActiveProfile(active);
-        await loadPlants();
       }
-      _log('updatePlant completed for id=${plant.id}');
+
+      _error = null;
+      _log('DONE updatePlant id=${plant.id}');
+      notifyListeners();
     } catch (error, stackTrace) {
-      _log('updatePlant failed for id=${plant.id}: $error');
+      _log('ERROR updatePlant id=${plant.id}: $error');
       debugPrintStack(stackTrace: stackTrace);
       _error = _friendlyDataMessage('update plant profile', error);
       notifyListeners();
@@ -124,20 +139,24 @@ class PlantProvider extends ChangeNotifier {
   }
 
   Future<void> deletePlant(String id) async {
-    _log('deletePlant started for id=$id');
+    _log('START deletePlant id=$id');
     try {
       await _firebaseService.deletePlantProfile(id);
-      await loadPlants();
+      _plants = _plants.where((plant) => plant.id != id).toList();
 
       if (_plants.isNotEmpty && !_plants.any((p) => p.isActive)) {
         final first = _plants.first;
         if (first.id != null) {
           await setActivePlant(first.id!);
+          return;
         }
       }
-      _log('deletePlant completed for id=$id');
+
+      _error = null;
+      _log('DONE deletePlant id=$id localCount=${_plants.length}');
+      notifyListeners();
     } catch (error, stackTrace) {
-      _log('deletePlant failed for id=$id: $error');
+      _log('ERROR deletePlant id=$id: $error');
       debugPrintStack(stackTrace: stackTrace);
       _error = _friendlyDataMessage('delete plant profile', error);
       notifyListeners();
@@ -155,7 +174,9 @@ class PlantProvider extends ChangeNotifier {
   }
 
   void _log(String message) {
-    debugPrint('[PlantProvider][$_uid] $message');
+    // Use print so messages appear in VS Code's terminal/debug console.
+    // ignore: avoid_print
+    print('[PlantProvider][$_uid] $message');
   }
 
   void _setLoading(bool isLoading) {
