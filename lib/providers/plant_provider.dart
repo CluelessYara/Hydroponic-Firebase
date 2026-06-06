@@ -6,8 +6,10 @@ import '../services/firebase_service.dart';
 
 class PlantProvider extends ChangeNotifier {
   PlantProvider({required String uid})
-      : _firebaseService = FirebaseService(uid: uid);
+      : _uid = uid,
+        _firebaseService = FirebaseService(uid: uid);
 
+  final String _uid;
   final FirebaseService _firebaseService;
 
   List<PlantProfile> _plants = [];
@@ -29,21 +31,30 @@ class PlantProvider extends ChangeNotifier {
   bool get hasPlants => _plants.isNotEmpty;
 
   Future<void> loadPlants() async {
+    _log('loadPlants started');
     _setLoading(true);
     try {
       _plants = await _firebaseService.getPlantProfiles();
+      _log('loadPlants received ${_plants.length} profile(s)');
 
       if (_plants.isNotEmpty && !_plants.any((p) => p.isActive)) {
         final first = _plants.first;
         if (first.id != null) {
+          _log(
+            'No active profile found; activating first profile id=${first.id}',
+          );
           await _firebaseService.setActiveProfile(first);
           _plants = await _firebaseService.getPlantProfiles();
+          _log('loadPlants received ${_plants.length} profile(s)');
         }
       }
 
       _error = null;
+      _log('loadPlants completed successfully');
       notifyListeners();
-    } catch (error) {
+    } catch (error, stackTrace) {
+      _log('loadPlants failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
       _error = _friendlyDataMessage('load plant profiles', error);
       notifyListeners();
     } finally {
@@ -52,15 +63,23 @@ class PlantProvider extends ChangeNotifier {
   }
 
   Future<void> addPlant(PlantProfile plant) async {
+    _log(
+      'addPlant started for name=${plant.name} existingCount=${_plants.length}',
+    );
     try {
       if (_plants.isEmpty) {
+        _log('addPlant will save and activate first profile');
         await _firebaseService.savePlantProfileAndActivate(plant);
       } else {
+        _log('addPlant will save non-active profile');
         await _firebaseService.savePlantProfile(plant);
       }
 
       await loadPlants();
-    } catch (error) {
+      _log('addPlant completed successfully');
+    } catch (error, stackTrace) {
+      _log('addPlant failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
       _error = _friendlyDataMessage('save plant profile', error);
       notifyListeners();
       rethrow;
@@ -68,11 +87,15 @@ class PlantProvider extends ChangeNotifier {
   }
 
   Future<void> setActivePlant(String id) async {
+    _log('setActivePlant started for id=$id');
     try {
       final selectedPlant = _plants.firstWhere((plant) => plant.id == id);
       await _firebaseService.setActiveProfile(selectedPlant);
       await loadPlants();
-    } catch (error) {
+      _log('setActivePlant completed for id=$id');
+    } catch (error, stackTrace) {
+      _log('setActivePlant failed for id=$id: $error');
+      debugPrintStack(stackTrace: stackTrace);
       _error = _friendlyDataMessage('set active plant profile', error);
       notifyListeners();
       rethrow;
@@ -80,6 +103,7 @@ class PlantProvider extends ChangeNotifier {
   }
 
   Future<void> updatePlant(PlantProfile plant) async {
+    _log('updatePlant started for id=${plant.id} name=${plant.name}');
     try {
       await _firebaseService.savePlantProfile(plant);
       await loadPlants();
@@ -89,7 +113,10 @@ class PlantProvider extends ChangeNotifier {
         await _firebaseService.setActiveProfile(active);
         await loadPlants();
       }
-    } catch (error) {
+      _log('updatePlant completed for id=${plant.id}');
+    } catch (error, stackTrace) {
+      _log('updatePlant failed for id=${plant.id}: $error');
+      debugPrintStack(stackTrace: stackTrace);
       _error = _friendlyDataMessage('update plant profile', error);
       notifyListeners();
       rethrow;
@@ -97,6 +124,7 @@ class PlantProvider extends ChangeNotifier {
   }
 
   Future<void> deletePlant(String id) async {
+    _log('deletePlant started for id=$id');
     try {
       await _firebaseService.deletePlantProfile(id);
       await loadPlants();
@@ -107,7 +135,10 @@ class PlantProvider extends ChangeNotifier {
           await setActivePlant(first.id!);
         }
       }
-    } catch (error) {
+      _log('deletePlant completed for id=$id');
+    } catch (error, stackTrace) {
+      _log('deletePlant failed for id=$id: $error');
+      debugPrintStack(stackTrace: stackTrace);
       _error = _friendlyDataMessage('delete plant profile', error);
       notifyListeners();
       rethrow;
@@ -121,6 +152,10 @@ class PlantProvider extends ChangeNotifier {
     }
 
     return 'Unable to $action: $error';
+  }
+
+  void _log(String message) {
+    debugPrint('[PlantProvider][$_uid] $message');
   }
 
   void _setLoading(bool isLoading) {

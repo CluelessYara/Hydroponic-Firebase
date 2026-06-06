@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../models/plant_profile.dart';
@@ -13,6 +15,9 @@ class CreatePlantScreen extends StatefulWidget {
 }
 
 class _CreatePlantScreenState extends State<CreatePlantScreen> {
+  static const Duration _slowSaveWarningDelay = Duration(seconds: 8);
+  static const Duration _screenSaveTimeout = Duration(seconds: 35);
+
   final _formKey = GlobalKey<FormState>();
 
   late final TextEditingController nameController;
@@ -26,6 +31,10 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
 
   bool _isSaving = false;
   String? _errorMessage;
+  String? _infoMessage;
+  String? _successMessage;
+  Timer? _slowSaveTimer;
+  Stopwatch? _saveStopwatch;
 
   @override
   void initState() {
@@ -50,6 +59,7 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
 
   @override
   void dispose() {
+    _slowSaveTimer?.cancel();
     nameController.dispose();
     phMinController.dispose();
     phMaxController.dispose();
@@ -83,8 +93,16 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
               _field(tdsMinController, 'TDS Min'),
               _field(tdsMaxController, 'TDS Max'),
               _field(wateringCycleController, 'Watering Cycle (hours)'),
+              if (_infoMessage != null) ...[
+                _messageBanner(_infoMessage!, Colors.orange),
+                const SizedBox(height: 12),
+              ],
+              if (_successMessage != null) ...[
+                _messageBanner(_successMessage!, Colors.green),
+                const SizedBox(height: 12),
+              ],
               if (_errorMessage != null) ...[
-                _errorBanner(_errorMessage!),
+                _messageBanner(_errorMessage!, Colors.red),
                 const SizedBox(height: 12),
               ],
               const SizedBox(height: 8),
@@ -111,10 +129,25 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
     setState(() {
       _isSaving = true;
       _errorMessage = null;
+      _infoMessage = 'Saving plant profile to Firebase...';
+      _successMessage = null;
+    });
+
+    _saveStopwatch = Stopwatch()..start();
+    _slowSaveTimer?.cancel();
+    _slowSaveTimer = Timer(_slowSaveWarningDelay, () {
+      if (!mounted || !_isSaving) return;
+      debugPrint(
+        '[CreatePlantScreen] Save still waiting after '
+        '${_slowSaveWarningDelay.inSeconds}s',
+      );
+      setState(() {
+        _infoMessage = 'Still saving... Firebase is taking longer than expected. '
+            'If this does not finish soon, check database rules and network.';
+      });
     });
 
     final old = widget.existingPlant;
-
     final plant = PlantProfile(
       id: old?.id,
       name: nameController.text.trim(),
@@ -128,39 +161,81 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
       isActive: old?.isActive ?? false,
     );
 
+    final action = isEdit ? 'update' : 'create';
+    debugPrint(
+      '[CreatePlantScreen] Save started action=$action '
+      'name=${plant.name} id=${plant.id}',
+    );
+
     try {
       final provider = context.read<PlantProvider>();
-      if (isEdit) {
-        await provider.updatePlant(plant);
-      } else {
-        await provider.addPlant(plant);
-      }
+      final saveFuture =
+          isEdit ? provider.updatePlant(plant) : provider.addPlant(plant);
+      await saveFuture.timeout(_screenSaveTimeout);
+
+      final elapsed = _saveStopwatch?.elapsed.inMilliseconds ?? 0;
+      debugPrint('[CreatePlantScreen] Save succeeded in ${elapsed}ms');
 
       if (!mounted) return;
+      _slowSaveTimer?.cancel();
+      setState(() {
+        _isSaving = false;
+        _infoMessage = null;
+        _errorMessage = null;
+        _successMessage = 'Saved successfully.';
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Plant profile saved successfully.')),
+      );
+
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      if (!mounted) return;
       Navigator.pop(context);
-    } catch (_) {
+    } on TimeoutException catch (error, stackTrace) {
+      debugPrint('[CreatePlantScreen] Save timed out: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      _showSaveError(
+        'Saving is taking too long. Check your internet connection, Firebase '
+        'Realtime Database rules, and that you deployed rules to the correct project.',
+      );
+    } catch (error, stackTrace) {
+      debugPrint('[CreatePlantScreen] Save failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
       if (!mounted) return;
       final providerError = context.read<PlantProvider>().error;
-      setState(() {
-        _errorMessage = providerError ??
-            'Unable to save this plant profile. Check your Firebase '
-                'connection and try again.';
-        _isSaving = false;
-      });
+      _showSaveError(
+        providerError ??
+            'Unable to save this plant profile. Check your Firebase connection '
+                'and try again.',
+      );
+    } finally {
+      _slowSaveTimer?.cancel();
+      _saveStopwatch?.stop();
     }
   }
 
-  Widget _errorBanner(String message) {
+  void _showSaveError(String message) {
+    if (!mounted) return;
+    setState(() {
+      _errorMessage = message;
+      _infoMessage = null;
+      _successMessage = null;
+      _isSaving = false;
+    });
+  }
+
+  Widget _messageBanner(String message, Color color) {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.red.withOpacity(0.12),
-        border: Border.all(color: Colors.red),
+        color: color.withOpacity(0.12),
+        border: Border.all(color: color),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Text(
         message,
-        style: const TextStyle(color: Colors.red),
+        style: TextStyle(color: color),
       ),
     );
   }
