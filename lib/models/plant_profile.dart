@@ -1,5 +1,5 @@
 class PlantProfile {
-  final int? id;
+  final String? id;
   final String name;
   final double phMin;
   final double phMax;
@@ -25,7 +25,7 @@ class PlantProfile {
 
   Map<String, dynamic> toMap() {
     return {
-      'id': id,
+      if (id != null) 'id': id,
       'name': name,
       'phMin': phMin,
       'phMax': phMax,
@@ -34,27 +34,27 @@ class PlantProfile {
       'tdsMin': tdsMin,
       'tdsMax': tdsMax,
       'wateringCycleHours': wateringCycleHours,
-      'isActive': isActive ? 1 : 0,
+      'isActive': isActive,
     };
   }
 
-  factory PlantProfile.fromMap(Map<String, dynamic> map) {
+  factory PlantProfile.fromMap(Map<String, dynamic> map, {String? id}) {
     return PlantProfile(
-      id: map['id'],
-      name: map['name'],
-      phMin: (map['phMin'] as num).toDouble(),
-      phMax: (map['phMax'] as num).toDouble(),
-      tempMin: (map['tempMin'] as num).toDouble(),
-      tempMax: (map['tempMax'] as num).toDouble(),
-      tdsMin: (map['tdsMin'] as num).toDouble(),
-      tdsMax: (map['tdsMax'] as num).toDouble(),
-      wateringCycleHours: map['wateringCycleHours'],
-      isActive: map['isActive'] == 1,
+      id: id ?? map['id']?.toString(),
+      name: map['name']?.toString() ?? '',
+      phMin: ((map['phMin'] ?? 0) as num).toDouble(),
+      phMax: ((map['phMax'] ?? 0) as num).toDouble(),
+      tempMin: ((map['tempMin'] ?? 0) as num).toDouble(),
+      tempMax: ((map['tempMax'] ?? 0) as num).toDouble(),
+      tdsMin: ((map['tdsMin'] ?? 0) as num).toDouble(),
+      tdsMax: ((map['tdsMax'] ?? 0) as num).toDouble(),
+      wateringCycleHours: ((map['wateringCycleHours'] ?? 0) as num).toInt(),
+      isActive: map['isActive'] == true || map['isActive'] == 1,
     );
   }
 
   PlantProfile copyWith({
-    int? id,
+    String? id,
     String? name,
     double? phMin,
     double? phMax,

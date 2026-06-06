@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../providers/app_auth_provider.dart';
 import '../providers/plant_provider.dart';
 import '../providers/sensor_provider.dart';
 import 'plant_list_screen.dart';
@@ -9,6 +10,7 @@ class DashboardScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final authProvider = context.watch<AppAuthProvider>();
     final plantProvider = context.watch<PlantProvider>();
     final sensorProvider = context.watch<SensorProvider>();
     final plant = plantProvider.activePlant;
@@ -27,6 +29,14 @@ class DashboardScreen extends StatelessWidget {
         title: Text(plant.name),
         actions: [
           IconButton(
+            tooltip: 'ESP32 user path',
+            icon: const Icon(Icons.memory),
+            onPressed: () {
+              _showEsp32Path(context, authProvider.user!.uid);
+            },
+          ),
+          IconButton(
+            tooltip: 'Plant profiles',
             icon: const Icon(Icons.list),
             onPressed: () {
               Navigator.push(
@@ -37,10 +47,23 @@ class DashboardScreen extends StatelessWidget {
               );
             },
           ),
+          IconButton(
+            tooltip: 'Sign out',
+            icon: const Icon(Icons.logout),
+            onPressed: () => context.read<AppAuthProvider>().signOut(),
+          ),
         ],
       ),
       body: status == null
-          ? const Center(child: CircularProgressIndicator())
+          ? const Center(
+              child: Padding(
+                padding: EdgeInsets.all(24),
+                child: Text(
+                  'Waiting for ESP32 sensor readings at your user-specific systemStatus path.',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            )
           : SingleChildScrollView(
               padding: const EdgeInsets.all(16),
               child: Column(
@@ -143,6 +166,26 @@ class DashboardScreen extends StatelessWidget {
                 ],
               ),
             ),
+    );
+  }
+
+  void _showEsp32Path(BuildContext context, String uid) {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('ESP32 RTDB path'),
+        content: SelectableText(
+          'Configure the ESP32 firmware to read active profile values from '
+          'users/$uid/activeProfile and write live readings to '
+          'users/$uid/systemStatus.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
     );
   }
 
