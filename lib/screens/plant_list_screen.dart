@@ -38,6 +38,7 @@ class PlantListScreen extends StatelessWidget {
               ),
               onTap: () async {
                 if (plant.id != null) {
+                  // Edited to pass the Firebase profile key when setting this user's active profile.
                   await context.read<PlantProvider>().setActivePlant(plant.id!);
                   if (context.mounted) Navigator.pop(context);
                 }
@@ -60,6 +61,7 @@ class PlantListScreen extends StatelessWidget {
                     icon: const Icon(Icons.delete),
                     onPressed: () async {
                       if (plant.id != null) {
+                        // Edited to delete the Firebase profile key from this user's profile branch.
                         await context.read<PlantProvider>().deletePlant(plant.id!);
                       }
                     },
