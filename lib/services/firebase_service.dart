@@ -1,8 +1,12 @@
+import 'dart:async';
+
 import 'package:firebase_database/firebase_database.dart';
 import '../models/plant_profile.dart';
 
 class FirebaseService {
   FirebaseService({required this.uid});
+
+  static const Duration _operationTimeout = Duration(seconds: 15);
 
   final String uid;
 
@@ -18,7 +22,7 @@ class FirebaseService {
   DatabaseReference get systemStatusRef => userRef.child('systemStatus');
 
   Future<List<PlantProfile>> getPlantProfiles() async {
-    final snapshot = await plantProfilesRef.get();
+    final snapshot = await plantProfilesRef.get().timeout(_operationTimeout);
     final value = snapshot.value;
 
     if (value == null) return [];
@@ -40,13 +44,35 @@ class FirebaseService {
     await ref.set({
       ...plant.copyWith(id: id).toMap(),
       'updatedAt': ServerValue.timestamp,
-    });
+    }).timeout(_operationTimeout);
+
+    return id;
+  }
+
+  Future<String> savePlantProfileAndActivate(PlantProfile plant) async {
+    final ref = plant.id == null
+        ? plantProfilesRef.push()
+        : plantProfilesRef.child(plant.id!);
+    final id = ref.key!;
+    final activePlant = plant.copyWith(id: id, isActive: true);
+
+    await userRef.update({
+      'plantProfiles/$id': {
+        ...activePlant.toMap(),
+        'updatedAt': ServerValue.timestamp,
+      },
+      'activeProfile': {
+        ...activePlant.toMap(),
+        'ownerUid': uid,
+        'updatedAt': ServerValue.timestamp,
+      },
+    }).timeout(_operationTimeout);
 
     return id;
   }
 
   Future<void> deletePlantProfile(String id) async {
-    await plantProfilesRef.child(id).remove();
+    await plantProfilesRef.child(id).remove().timeout(_operationTimeout);
   }
 
   Future<void> setActiveProfile(PlantProfile plant) async {
@@ -72,7 +98,7 @@ class FirebaseService {
       }
     }
 
-    await userRef.update(updates);
+    await userRef.update(updates).timeout(_operationTimeout);
   }
 
   Stream<DatabaseEvent> watchSystemStatus() {

@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../models/plant_profile.dart';
 import '../services/firebase_service.dart';
 
 class PlantProvider extends ChangeNotifier {
-  PlantProvider({required String uid}) : _firebaseService = FirebaseService(uid: uid);
+  PlantProvider({required String uid})
+      : _firebaseService = FirebaseService(uid: uid);
 
   final FirebaseService _firebaseService;
 
@@ -33,15 +36,15 @@ class PlantProvider extends ChangeNotifier {
       if (_plants.isNotEmpty && !_plants.any((p) => p.isActive)) {
         final first = _plants.first;
         if (first.id != null) {
-          await setActivePlant(first.id!);
-          return;
+          await _firebaseService.setActiveProfile(first);
+          _plants = await _firebaseService.getPlantProfiles();
         }
       }
 
       _error = null;
       notifyListeners();
     } catch (error) {
-      _error = 'Unable to load plant profiles: $error';
+      _error = _friendlyDataMessage('load plant profiles', error);
       notifyListeners();
     } finally {
       _setLoading(false);
@@ -50,24 +53,30 @@ class PlantProvider extends ChangeNotifier {
 
   Future<void> addPlant(PlantProfile plant) async {
     try {
-      final shouldActivate = _plants.isEmpty;
-      final id = await _firebaseService.savePlantProfile(plant);
-      await loadPlants();
-
-      if (shouldActivate) {
-        await setActivePlant(id);
+      if (_plants.isEmpty) {
+        await _firebaseService.savePlantProfileAndActivate(plant);
+      } else {
+        await _firebaseService.savePlantProfile(plant);
       }
+
+      await loadPlants();
     } catch (error) {
-      _error = 'Unable to save plant profile: $error';
+      _error = _friendlyDataMessage('save plant profile', error);
       notifyListeners();
       rethrow;
     }
   }
 
   Future<void> setActivePlant(String id) async {
-    final selectedPlant = _plants.firstWhere((plant) => plant.id == id);
-    await _firebaseService.setActiveProfile(selectedPlant);
-    await loadPlants();
+    try {
+      final selectedPlant = _plants.firstWhere((plant) => plant.id == id);
+      await _firebaseService.setActiveProfile(selectedPlant);
+      await loadPlants();
+    } catch (error) {
+      _error = _friendlyDataMessage('set active plant profile', error);
+      notifyListeners();
+      rethrow;
+    }
   }
 
   Future<void> updatePlant(PlantProfile plant) async {
@@ -78,24 +87,40 @@ class PlantProvider extends ChangeNotifier {
       final active = activePlant;
       if (active != null && active.id == plant.id) {
         await _firebaseService.setActiveProfile(active);
+        await loadPlants();
       }
     } catch (error) {
-      _error = 'Unable to update plant profile: $error';
+      _error = _friendlyDataMessage('update plant profile', error);
       notifyListeners();
       rethrow;
     }
   }
 
   Future<void> deletePlant(String id) async {
-    await _firebaseService.deletePlantProfile(id);
-    await loadPlants();
+    try {
+      await _firebaseService.deletePlantProfile(id);
+      await loadPlants();
 
-    if (_plants.isNotEmpty && !_plants.any((p) => p.isActive)) {
-      final first = _plants.first;
-      if (first.id != null) {
-        await setActivePlant(first.id!);
+      if (_plants.isNotEmpty && !_plants.any((p) => p.isActive)) {
+        final first = _plants.first;
+        if (first.id != null) {
+          await setActivePlant(first.id!);
+        }
       }
+    } catch (error) {
+      _error = _friendlyDataMessage('delete plant profile', error);
+      notifyListeners();
+      rethrow;
     }
+  }
+
+  String _friendlyDataMessage(String action, Object error) {
+    if (error is TimeoutException) {
+      return 'Unable to $action because Firebase did not respond. Check '
+          'your internet connection, Firebase project, and database rules.';
+    }
+
+    return 'Unable to $action: $error';
   }
 
   void _setLoading(bool isLoading) {

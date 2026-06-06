@@ -31,6 +31,22 @@ The dashboard includes an ESP32 path button that shows the signed-in user's exac
 firebase deploy --only database
 ```
 
+## Troubleshooting profile saves
+
+If the create-profile screen keeps waiting or shows a Firebase error after you
+tap **Save Profile**, check these items first:
+
+1. Confirm the app is signed in with a Firebase Auth user.
+2. Enable **Authentication > Sign-in method > Email/Password** in Firebase
+   Console.
+3. Deploy `database.rules.json` to the same Firebase project used by the app.
+4. Confirm your local app has network access to the RTDB URL in
+   `lib/services/firebase_service.dart`.
+
+The app adds a timeout around profile save/load operations so failed Firebase
+permissions or network problems now return an error message instead of looking
+like the form is frozen.
+
 ## Development
 
 Install Flutter dependencies before running the app:
