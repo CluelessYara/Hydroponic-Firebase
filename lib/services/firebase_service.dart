@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:firebase_database/firebase_database.dart';
 import '../models/plant_profile.dart';
 
@@ -23,16 +22,19 @@ class FirebaseService {
   DatabaseReference get systemStatusRef => userRef.child('systemStatus');
 
   Future<List<PlantProfile>> getPlantProfiles() async {
-    _log('Loading plant profiles from ${plantProfilesRef.path}');
-    final snapshot = await plantProfilesRef.get().timeout(_operationTimeout);
+    _log('START getPlantProfiles path=${plantProfilesRef.path}');
+    final snapshot = await _withTimeout(
+      plantProfilesRef.get(),
+      'getPlantProfiles ${plantProfilesRef.path}',
+    );
     final value = snapshot.value;
 
     if (value == null) {
-      _log('No plant profiles found at ${plantProfilesRef.path}');
+      _log('DONE getPlantProfiles: no profiles found');
       return [];
     }
     if (value is! Map) {
-      _log('Unexpected plant profile payload type: ${value.runtimeType}');
+      _log('DONE getPlantProfiles: unexpected payload ${value.runtimeType}');
       return [];
     }
 
@@ -42,7 +44,7 @@ class FirebaseService {
     }).toList()
       ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
 
-    _log('Loaded ${profiles.length} plant profile(s) for uid=$uid');
+    _log('DONE getPlantProfiles count=${profiles.length}');
     return profiles;
   }
 
@@ -52,13 +54,16 @@ class FirebaseService {
         : plantProfilesRef.child(plant.id!);
     final id = ref.key!;
 
-    _log('Saving plant profile id=$id name=${plant.name} to ${ref.path}');
-    await ref.set({
-      ...plant.copyWith(id: id).toMap(),
-      'updatedAt': ServerValue.timestamp,
-    }).timeout(_operationTimeout);
+    _log('START savePlantProfile id=$id name=${plant.name} path=${ref.path}');
+    await _withTimeout(
+      ref.set({
+        ...plant.copyWith(id: id).toMap(),
+        'updatedAt': ServerValue.timestamp,
+      }),
+      'savePlantProfile ${ref.path}',
+    );
 
-    _log('Saved plant profile id=$id');
+    _log('DONE savePlantProfile id=$id');
     return id;
   }
 
@@ -70,29 +75,35 @@ class FirebaseService {
     final activePlant = plant.copyWith(id: id, isActive: true);
 
     _log(
-      'Saving and activating first plant profile id=$id '
-      'name=${plant.name} under ${userRef.path}',
+      'START savePlantProfileAndActivate id=$id name=${plant.name} '
+      'path=${userRef.path}',
     );
-    await userRef.update({
-      'plantProfiles/$id': {
-        ...activePlant.toMap(),
-        'updatedAt': ServerValue.timestamp,
-      },
-      'activeProfile': {
-        ...activePlant.toMap(),
-        'ownerUid': uid,
-        'updatedAt': ServerValue.timestamp,
-      },
-    }).timeout(_operationTimeout);
+    await _withTimeout(
+      userRef.update({
+        'plantProfiles/$id': {
+          ...activePlant.toMap(),
+          'updatedAt': ServerValue.timestamp,
+        },
+        'activeProfile': {
+          ...activePlant.toMap(),
+          'ownerUid': uid,
+          'updatedAt': ServerValue.timestamp,
+        },
+      }),
+      'savePlantProfileAndActivate ${userRef.path}',
+    );
 
-    _log('Saved and activated plant profile id=$id');
+    _log('DONE savePlantProfileAndActivate id=$id');
     return id;
   }
 
   Future<void> deletePlantProfile(String id) async {
-    _log('Deleting plant profile id=$id');
-    await plantProfilesRef.child(id).remove().timeout(_operationTimeout);
-    _log('Deleted plant profile id=$id');
+    _log('START deletePlantProfile id=$id');
+    await _withTimeout(
+      plantProfilesRef.child(id).remove(),
+      'deletePlantProfile ${plantProfilesRef.child(id).path}',
+    );
+    _log('DONE deletePlantProfile id=$id');
   }
 
   Future<void> setActiveProfile(PlantProfile plant) async {
@@ -100,7 +111,7 @@ class FirebaseService {
       throw ArgumentError('Cannot activate a plant profile without an id.');
     }
 
-    _log('Setting active plant profile id=${plant.id} name=${plant.name}');
+    _log('START setActiveProfile id=${plant.id} name=${plant.name}');
     final profile = plant.copyWith(isActive: true);
     final updates = <String, Object?>{
       'activeProfile': {
@@ -119,12 +130,30 @@ class FirebaseService {
       }
     }
 
-    await userRef.update(updates).timeout(_operationTimeout);
-    _log('Active plant profile set to id=${plant.id}');
+    await _withTimeout(
+      userRef.update(updates),
+      'setActiveProfile ${userRef.path}',
+    );
+    _log('DONE setActiveProfile id=${plant.id}');
+  }
+
+  Future<T> _withTimeout<T>(Future<T> future, String operation) {
+    return future.timeout(
+      _operationTimeout,
+      onTimeout: () {
+        _log('TIMEOUT $operation after ${_operationTimeout.inSeconds}s');
+        throw TimeoutException(
+          '$operation timed out after ${_operationTimeout.inSeconds} seconds',
+          _operationTimeout,
+        );
+      },
+    );
   }
 
   void _log(String message) {
-    debugPrint('[FirebaseService][$uid] $message');
+    // Use print so messages appear in VS Code's terminal/debug console.
+    // ignore: avoid_print
+    print('[FirebaseService][$uid] $message');
   }
 
   Stream<DatabaseEvent> watchSystemStatus() {

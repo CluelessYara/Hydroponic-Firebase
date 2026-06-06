@@ -16,7 +16,8 @@ class CreatePlantScreen extends StatefulWidget {
 
 class _CreatePlantScreenState extends State<CreatePlantScreen> {
   static const Duration _slowSaveWarningDelay = Duration(seconds: 8);
-  static const Duration _screenSaveTimeout = Duration(seconds: 35);
+  static const Duration _hardSaveFailureDelay = Duration(seconds: 20);
+  static const Duration _screenSaveTimeout = Duration(seconds: 20);
 
   final _formKey = GlobalKey<FormState>();
 
@@ -34,7 +35,10 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
   String? _infoMessage;
   String? _successMessage;
   Timer? _slowSaveTimer;
+  Timer? _hardSaveTimer;
   Stopwatch? _saveStopwatch;
+  int _saveAttemptId = 0;
+  final List<String> _debugMessages = [];
 
   @override
   void initState() {
@@ -60,6 +64,7 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
   @override
   void dispose() {
     _slowSaveTimer?.cancel();
+    _hardSaveTimer?.cancel();
     nameController.dispose();
     phMinController.dispose();
     phMaxController.dispose();
@@ -105,6 +110,10 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
                 _messageBanner(_errorMessage!, Colors.red),
                 const SizedBox(height: 12),
               ],
+              if (_debugMessages.isNotEmpty) ...[
+                _debugPanel(),
+                const SizedBox(height: 12),
+              ],
               const SizedBox(height: 8),
               ElevatedButton(
                 onPressed: _isSaving ? null : () => _saveProfile(isEdit),
@@ -126,25 +135,36 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
   Future<void> _saveProfile(bool isEdit) async {
     if (!_formKey.currentState!.validate()) return;
 
+    final attemptId = ++_saveAttemptId;
     setState(() {
       _isSaving = true;
       _errorMessage = null;
       _infoMessage = 'Saving plant profile to Firebase...';
       _successMessage = null;
+      _debugMessages.clear();
     });
 
     _saveStopwatch = Stopwatch()..start();
+    _log('Save button tapped');
     _slowSaveTimer?.cancel();
+    _hardSaveTimer?.cancel();
     _slowSaveTimer = Timer(_slowSaveWarningDelay, () {
       if (!mounted || !_isSaving) return;
-      debugPrint(
-        '[CreatePlantScreen] Save still waiting after '
-        '${_slowSaveWarningDelay.inSeconds}s',
-      );
+      _log('Save still waiting after ${_slowSaveWarningDelay.inSeconds}s');
       setState(() {
         _infoMessage = 'Still saving... Firebase is taking longer than expected. '
             'If this does not finish soon, check database rules and network.';
       });
+    });
+    _hardSaveTimer = Timer(_hardSaveFailureDelay, () {
+      if (!mounted || !_isSaving || attemptId != _saveAttemptId) return;
+      _log('Hard save timer fired after ${_hardSaveFailureDelay.inSeconds}s');
+      _showSaveError(
+        'Saving is taking too long, so the app stopped waiting. This usually '
+        'means Firebase rejected the write, rules were not deployed, the app is '
+        'offline, or the wrong Firebase project is configured. Check the debug '
+        'messages below and your VS Code terminal.',
+      );
     });
 
     final old = widget.existingPlant;
@@ -162,9 +182,8 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
     );
 
     final action = isEdit ? 'update' : 'create';
-    debugPrint(
-      '[CreatePlantScreen] Save started action=$action '
-      'name=${plant.name} id=${plant.id}',
+    _log(
+      'Save started action=$action name=${plant.name} id=${plant.id}',
     );
 
     try {
@@ -174,10 +193,11 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
       await saveFuture.timeout(_screenSaveTimeout);
 
       final elapsed = _saveStopwatch?.elapsed.inMilliseconds ?? 0;
-      debugPrint('[CreatePlantScreen] Save succeeded in ${elapsed}ms');
+      _log('Save succeeded in ${elapsed}ms');
 
-      if (!mounted) return;
+      if (!mounted || attemptId != _saveAttemptId || !_isSaving) return;
       _slowSaveTimer?.cancel();
+      _hardSaveTimer?.cancel();
       setState(() {
         _isSaving = false;
         _infoMessage = null;
@@ -193,14 +213,14 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
       if (!mounted) return;
       Navigator.pop(context);
     } on TimeoutException catch (error, stackTrace) {
-      debugPrint('[CreatePlantScreen] Save timed out: $error');
+      _log('Save timed out: $error');
       debugPrintStack(stackTrace: stackTrace);
       _showSaveError(
         'Saving is taking too long. Check your internet connection, Firebase '
         'Realtime Database rules, and that you deployed rules to the correct project.',
       );
     } catch (error, stackTrace) {
-      debugPrint('[CreatePlantScreen] Save failed: $error');
+      _log('Save failed: $error');
       debugPrintStack(stackTrace: stackTrace);
       if (!mounted) return;
       final providerError = context.read<PlantProvider>().error;
@@ -211,18 +231,54 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
       );
     } finally {
       _slowSaveTimer?.cancel();
+      _hardSaveTimer?.cancel();
       _saveStopwatch?.stop();
     }
   }
 
   void _showSaveError(String message) {
     if (!mounted) return;
+    _log('Showing save error: $message');
     setState(() {
       _errorMessage = message;
       _infoMessage = null;
       _successMessage = null;
       _isSaving = false;
     });
+  }
+
+  void _log(String message) {
+    final elapsed = _saveStopwatch?.elapsed.inSeconds;
+    final timestamp = elapsed == null ? '' : '+${elapsed}s ';
+    final line = '[CreatePlantScreen] $timestamp$message';
+    // ignore: avoid_print
+    print(line);
+    if (!mounted) return;
+    setState(() {
+      _debugMessages.add(line);
+      if (_debugMessages.length > 8) {
+        _debugMessages.removeAt(0);
+      }
+    });
+  }
+
+  Widget _debugPanel() {
+    return ExpansionTile(
+      tilePadding: EdgeInsets.zero,
+      title: const Text('Save debug messages'),
+      subtitle: const Text('Also printed to the VS Code terminal/debug console.'),
+      children: _debugMessages
+          .map(
+            (message) => Align(
+              alignment: Alignment.centerLeft,
+              child: SelectableText(
+                message,
+                style: const TextStyle(fontSize: 12),
+              ),
+            ),
+          )
+          .toList(),
+    );
   }
 
   Widget _messageBanner(String message, Color color) {
