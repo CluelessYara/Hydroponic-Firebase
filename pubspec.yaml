@@ -39,6 +39,8 @@ dependencies:
   path: ^1.9.1
   firebase_core: ^4.7.0
   firebase_database: ^12.3.0
+  # Edited to add Firebase email/password user accounts for per-user plant profiles and RTDB branches.
+  firebase_auth: ^6.5.2
 
 dev_dependencies:
   flutter_test:

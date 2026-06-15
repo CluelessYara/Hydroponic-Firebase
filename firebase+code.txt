@@ -1,0 +1,437 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ArduinoJson.h>
+
+// WiFi
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Firebase Auth credentials for the exact app user this ESP32 should serve.
+// Edited to authenticate the ESP32 as a Firebase user because the new RTDB rules only allow /users/<uid> access to that same signed-in uid.
+const char* firebaseApiKey = "YOUR_FIREBASE_WEB_API_KEY";
+const char* firebaseEmail = "YOUR_FIREBASE_USER_EMAIL";
+const char* firebasePassword = "YOUR_FIREBASE_USER_PASSWORD";
+
+// Firebase project/database configuration.
+// Edited to keep one database host and build per-user paths after Firebase Auth returns the user's localId/uid.
+const char* firebaseDatabaseHost =
+    "https://hydroponic-system-61a0f-default-rtdb.asia-southeast1.firebasedatabase.app";
+
+// DS18B20 pin
+#define ONE_WIRE_BUS 26
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+WiFiClientSecure client;
+
+// Firebase Auth session values.
+// Edited to store idToken and uid so REST requests target /users/<uid> and satisfy authenticated RTDB rules.
+String firebaseIdToken = "";
+String firebaseUid = "";
+unsigned long firebaseAuthTime = 0;
+const unsigned long firebaseTokenRefreshMs = 50UL * 60UL * 1000UL;
+
+// Active profile variables
+String plantName = "";
+String activeProfileId = "";
+bool isActive = false;
+
+float phMin = 0;
+float phMax = 0;
+
+float tdsMin = 0;
+float tdsMax = 0;
+
+float tempMin = 0;
+float tempMax = 0;
+
+int wateringCycleHours = 0;
+
+String urlEncode(String value) {
+  // Edited to safely put Firebase idToken in the REST query string.
+  value.replace("%", "%25");
+  value.replace(" ", "%20");
+  value.replace("+", "%2B");
+  value.replace("/", "%2F");
+  value.replace("=", "%3D");
+  value.replace(":", "%3A");
+  return value;
+}
+
+String firebasePathUrl(const String& userChildPath) {
+  // Edited to route every Firebase REST call through the authenticated user's RTDB branch.
+  return String(firebaseDatabaseHost) + "/users/" + firebaseUid + "/" +
+         userChildPath + ".json?auth=" + urlEncode(firebaseIdToken);
+}
+
+bool signInToFirebase() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected!");
+    return false;
+  }
+
+  HTTPClient http;
+  String authUrl =
+      "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" +
+      String(firebaseApiKey);
+
+  http.begin(client, authUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<384> requestDoc;
+  requestDoc["email"] = firebaseEmail;
+  requestDoc["password"] = firebasePassword;
+  requestDoc["returnSecureToken"] = true;
+
+  String requestBody;
+  serializeJson(requestDoc, requestBody);
+
+  Serial.println();
+  Serial.println("Signing ESP32 into Firebase Auth...");
+
+  int httpResponseCode = http.POST(requestBody);
+  String payload = http.getString();
+
+  Serial.print("Firebase Auth Response: ");
+  Serial.println(httpResponseCode);
+
+  http.end();
+
+  if (httpResponseCode != 200) {
+    Serial.println("Failed to sign in to Firebase Auth!");
+    Serial.println(payload);
+    return false;
+  }
+
+  StaticJsonDocument<2048> responseDoc;
+  DeserializationError error = deserializeJson(responseDoc, payload);
+
+  if (error) {
+    Serial.print("Firebase Auth JSON parsing failed: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+
+  firebaseIdToken = responseDoc["idToken"].as<String>();
+  firebaseUid = responseDoc["localId"].as<String>();
+  firebaseAuthTime = millis();
+
+  if (firebaseIdToken.length() == 0 || firebaseUid.length() == 0) {
+    Serial.println("Firebase Auth response did not include idToken/localId!");
+    return false;
+  }
+
+  Serial.println("Firebase Auth sign-in successful.");
+  Serial.print("Target Firebase UID: ");
+  Serial.println(firebaseUid);
+
+  return true;
+}
+
+bool ensureFirebaseAuth() {
+  // Edited to refresh auth before the one-hour Firebase idToken expires.
+  if (firebaseIdToken.length() == 0 || firebaseUid.length() == 0) {
+    return signInToFirebase();
+  }
+
+  if (millis() - firebaseAuthTime > firebaseTokenRefreshMs) {
+    return signInToFirebase();
+  }
+
+  return true;
+}
+
+// Function to read activeProfile from Firebase
+bool getActiveProfile(bool allowAuthRetry = true) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected!");
+    return false;
+  }
+
+  if (!ensureFirebaseAuth()) {
+    Serial.println("Cannot read activeProfile without Firebase Auth!");
+    return false;
+  }
+
+  HTTPClient http;
+
+  // Edited to read /users/<authenticated uid>/activeProfile instead of the old global /activeProfile.
+  String activeProfileUrl = firebasePathUrl("activeProfile");
+  http.begin(client, activeProfileUrl);
+
+  Serial.println();
+  Serial.println("Reading user-scoped activeProfile from Firebase...");
+
+  int httpResponseCode = http.GET();
+
+  Serial.print("GET activeProfile Response: ");
+  Serial.println(httpResponseCode);
+
+  if (httpResponseCode == 401 || httpResponseCode == 403) {
+    // Edited to recover automatically if the Firebase token expired or rules rejected the old token.
+    http.end();
+    firebaseIdToken = "";
+    if (allowAuthRetry && ensureFirebaseAuth()) {
+      return getActiveProfile(false);
+    }
+    return false;
+  }
+
+  if (httpResponseCode != 200) {
+    Serial.println("Failed to read activeProfile!");
+    Serial.println(http.getString());
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+
+  Serial.println("activeProfile JSON:");
+  Serial.println(payload);
+
+  http.end();
+
+  if (payload == "null") {
+    Serial.println("No activeProfile exists for this user yet.");
+    return false;
+  }
+
+  StaticJsonDocument<1024> doc;
+
+  DeserializationError error = deserializeJson(doc, payload);
+
+  if (error) {
+    Serial.print("JSON parsing failed: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+
+  isActive = doc["isActive"] | false;
+  plantName = doc["name"] | "Unknown";
+  activeProfileId = doc["id"] | "";
+
+  phMin = doc["phMin"] | 0.0;
+  phMax = doc["phMax"] | 0.0;
+
+  tdsMin = doc["tdsMin"] | 0.0;
+  tdsMax = doc["tdsMax"] | 0.0;
+
+  tempMin = doc["tempMin"] | 0.0;
+  tempMax = doc["tempMax"] | 0.0;
+
+  wateringCycleHours = doc["wateringCycleHours"] | 0;
+
+  Serial.println();
+  Serial.println("Profile loaded successfully:");
+  Serial.print("Plant name: ");
+  Serial.println(plantName);
+
+  Serial.print("Profile id: ");
+  Serial.println(activeProfileId);
+
+  Serial.print("isActive: ");
+  Serial.println(isActive);
+
+  Serial.print("Temperature Min: ");
+  Serial.println(tempMin);
+
+  Serial.print("Temperature Max: ");
+  Serial.println(tempMax);
+
+  Serial.print("pH Min: ");
+  Serial.println(phMin);
+
+  Serial.print("pH Max: ");
+  Serial.println(phMax);
+
+  Serial.print("TDS Min: ");
+  Serial.println(tdsMin);
+
+  Serial.print("TDS Max: ");
+  Serial.println(tdsMax);
+
+  Serial.print("Watering cycle hours: ");
+  Serial.println(wateringCycleHours);
+
+  return true;
+}
+
+// Function to check temperature status
+String checkTemperatureStatus(float temperature) {
+  if (temperature < tempMin) {
+    return "LOW";
+  } else if (temperature > tempMax) {
+    return "HIGH";
+  } else {
+    return "OK";
+  }
+}
+
+bool uploadSystemStatus(float temperature, const String& tempStatus,
+                        const String& overallStatus,
+                        bool allowAuthRetry = true) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected!");
+    return false;
+  }
+
+  if (!ensureFirebaseAuth()) {
+    Serial.println("Cannot upload systemStatus without Firebase Auth!");
+    return false;
+  }
+
+  HTTPClient http;
+
+  // Edited to write /users/<authenticated uid>/systemStatus instead of the old global /systemStatus.
+  String systemStatusUrl = firebasePathUrl("systemStatus");
+  http.begin(client, systemStatusUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<1024> doc;
+  doc["activePlant"] = plantName;
+  doc["activeProfileId"] = activeProfileId;
+  doc["ownerUid"] = firebaseUid;
+  doc["isActive"] = isActive;
+
+  doc["temperature"] = temperature;
+  doc["temperatureStatus"] = tempStatus;
+
+  // Edited to send numeric placeholder values instead of null because the Flutter app casts these fields as numbers.
+  doc["ph"] = 0;
+  doc["tds"] = 0;
+  doc["waterLevel"] = 0;
+
+  JsonObject profile = doc.createNestedObject("profile");
+  profile["phMin"] = phMin;
+  profile["phMax"] = phMax;
+  profile["tdsMin"] = tdsMin;
+  profile["tdsMax"] = tdsMax;
+  profile["tempMin"] = tempMin;
+  profile["tempMax"] = tempMax;
+  profile["wateringCycleHours"] = wateringCycleHours;
+
+  // Edited to send a boolean placeholder instead of null because the Flutter app casts isFlooding as bool.
+  doc["isFlooding"] = false;
+  doc["overallStatus"] = overallStatus;
+  doc["timestamp"] = String(millis());
+
+  JsonArray warnings = doc.createNestedArray("warnings");
+  if (tempStatus == "LOW") {
+    warnings.add("Temperature is below the active profile minimum.");
+  } else if (tempStatus == "HIGH") {
+    warnings.add("Temperature is above the active profile maximum.");
+  }
+
+  String json;
+  serializeJson(doc, json);
+
+  Serial.print("Sending user-scoped JSON: ");
+  Serial.println(json);
+
+  int httpResponseCode = http.PUT(json);
+
+  Serial.print("PUT systemStatus Response: ");
+  Serial.println(httpResponseCode);
+
+  String response = http.getString();
+  Serial.print("Firebase Response: ");
+  Serial.println(response);
+
+  http.end();
+
+  if (httpResponseCode == 401 || httpResponseCode == 403) {
+    // Edited to retry only once after refreshing auth so a rule mismatch cannot recurse forever.
+    firebaseIdToken = "";
+    if (allowAuthRetry && ensureFirebaseAuth()) {
+      return uploadSystemStatus(temperature, tempStatus, overallStatus, false);
+    }
+  }
+
+  return httpResponseCode == 200;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  sensors.begin();
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // For HTTPS Firebase connection
+  client.setInsecure();
+
+  // Edited to sign in once at startup so the ESP32 targets the same Firebase Auth user branch as the Flutter app.
+  ensureFirebaseAuth();
+
+  // Read active profile once at startup
+  getActiveProfile();
+}
+
+void loop() {
+  // Read the active profile every loop
+  // So if you change the plant from Firebase, ESP32 will update automatically
+  bool profileOK = getActiveProfile();
+
+  if (!profileOK) {
+    Serial.println("Cannot continue without active profile!");
+    delay(5000);
+    return;
+  }
+
+  if (!isActive) {
+    Serial.println("No active plant profile!");
+    delay(5000);
+    return;
+  }
+
+  sensors.requestTemperatures();
+  float temperature = sensors.getTempCByIndex(0);
+
+  if (temperature == DEVICE_DISCONNECTED_C || temperature == -127.00) {
+    Serial.println("ERROR: DS18B20 temperature sensor not detected!");
+    delay(5000);
+    return;
+  }
+
+  String tempStatus = checkTemperatureStatus(temperature);
+
+  String overallStatus = "Normal";
+
+  if (tempStatus == "LOW" || tempStatus == "HIGH") {
+    overallStatus = "Warning";
+  }
+
+  Serial.println("-------------------------");
+  Serial.print("Firebase UID: ");
+  Serial.println(firebaseUid);
+
+  Serial.print("Plant: ");
+  Serial.println(plantName);
+
+  Serial.print("Temperature: ");
+  Serial.print(temperature, 2);
+  Serial.println(" C");
+
+  Serial.print("Temperature Status: ");
+  Serial.println(tempStatus);
+
+  uploadSystemStatus(temperature, tempStatus, overallStatus);
+
+  delay(5000);
+}

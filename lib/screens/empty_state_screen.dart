@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '../providers/auth_provider.dart';
 import 'create_plant_screen.dart';
 
 class EmptyStateScreen extends StatelessWidget {
@@ -7,6 +10,19 @@ class EmptyStateScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      appBar: AppBar(
+        title: const Text('Hydroponic Monitor'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout),
+            tooltip: 'Sign out',
+            onPressed: () {
+              // Edited to let users leave an empty account and sign into a different Firebase account.
+              context.read<AppAuthProvider>().signOut();
+            },
+          ),
+        ],
+      ),
       body: Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -21,7 +37,8 @@ class EmptyStateScreen extends StatelessWidget {
               ),
               const SizedBox(height: 12),
               const Text(
-                'Create your first plant profile to start monitoring your hydroponic system.',
+                // Edited to clarify that profiles are now stored under the signed-in Firebase account.
+                'Create your first cloud plant profile for this account to start monitoring your hydroponic system.',
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 24),

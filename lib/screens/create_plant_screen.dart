@@ -71,6 +71,7 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
                   final old = widget.existingPlant;
 
                   final plant = PlantProfile(
+                    // Edited to preserve the Firebase profile key when updating an existing cloud profile.
                     id: old?.id,
                     name: nameController.text.trim(),
                     phMin: double.parse(phMinController.text),
@@ -83,6 +84,7 @@ class _CreatePlantScreenState extends State<CreatePlantScreen> {
                     isActive: old?.isActive ?? false,
                   );
 
+                  // Edited to route saves through PlantProvider so profiles persist under the signed-in user's account.
                   if (isEdit) {
                     await context.read<PlantProvider>().updatePlant(plant);
                   } else {
