@@ -1,0 +1,265 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ArduinoJson.h>
+
+// WiFi
+const char* ssid = "Home 2024";
+const char* password = "Naeem126";
+
+// Firebase URLs
+const char* activeProfileUrl =
+"https://hydroponic-system-61a0f-default-rtdb.asia-southeast1.firebasedatabase.app/activeProfile.json";
+
+const char* systemStatusUrl =
+"https://hydroponic-system-61a0f-default-rtdb.asia-southeast1.firebasedatabase.app/systemStatus.json";
+
+// DS18B20 pin
+#define ONE_WIRE_BUS 26
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+WiFiClientSecure client;
+
+// Active profile variables
+String plantName = "";
+bool isActive = false;
+
+float phMin = 0;
+float phMax = 0;
+
+float tdsMin = 0;
+float tdsMax = 0;
+
+float tempMin = 0;
+float tempMax = 0;
+
+int wateringCycleHours = 0;
+
+// Function to read activeProfile from Firebase
+bool getActiveProfile() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected!");
+    return false;
+  }
+
+  HTTPClient http;
+
+  http.begin(client, activeProfileUrl);
+
+  Serial.println();
+  Serial.println("Reading activeProfile from Firebase...");
+
+  int httpResponseCode = http.GET();
+
+  Serial.print("GET activeProfile Response: ");
+  Serial.println(httpResponseCode);
+
+  if (httpResponseCode != 200) {
+    Serial.println("Failed to read activeProfile!");
+    Serial.println(http.getString());
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+
+  Serial.println("activeProfile JSON:");
+  Serial.println(payload);
+
+  http.end();
+
+  StaticJsonDocument<1024> doc;
+
+  DeserializationError error = deserializeJson(doc, payload);
+
+  if (error) {
+    Serial.print("JSON parsing failed: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+
+  isActive = doc["isActive"] | false;
+  plantName = doc["name"] | "Unknown";
+
+  phMin = doc["phMin"] | 0.0;
+  phMax = doc["phMax"] | 0.0;
+
+  tdsMin = doc["tdsMin"] | 0.0;
+  tdsMax = doc["tdsMax"] | 0.0;
+
+  tempMin = doc["tempMin"] | 0.0;
+  tempMax = doc["tempMax"] | 0.0;
+
+  wateringCycleHours = doc["wateringCycleHours"] | 0;
+
+  Serial.println();
+  Serial.println("Profile loaded successfully:");
+  Serial.print("Plant name: ");
+  Serial.println(plantName);
+
+  Serial.print("isActive: ");
+  Serial.println(isActive);
+
+  Serial.print("Temperature Min: ");
+  Serial.println(tempMin);
+
+  Serial.print("Temperature Max: ");
+  Serial.println(tempMax);
+
+  Serial.print("pH Min: ");
+  Serial.println(phMin);
+
+  Serial.print("pH Max: ");
+  Serial.println(phMax);
+
+  Serial.print("TDS Min: ");
+  Serial.println(tdsMin);
+
+  Serial.print("TDS Max: ");
+  Serial.println(tdsMax);
+
+  Serial.print("Watering cycle hours: ");
+  Serial.println(wateringCycleHours);
+
+  return true;
+}
+
+// Function to check temperature status
+String checkTemperatureStatus(float temperature) {
+  if (temperature < tempMin) {
+    return "LOW";
+  } else if (temperature > tempMax) {
+    return "HIGH";
+  } else {
+    return "OK";
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  sensors.begin();
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // For HTTPS Firebase connection
+  client.setInsecure();
+
+  // Read active profile once at startup
+  getActiveProfile();
+}
+
+void loop() {
+  // Read the active profile every loop
+  // So if you change the plant from Firebase, ESP32 will update automatically
+  bool profileOK = getActiveProfile();
+
+  if (!profileOK) {
+    Serial.println("Cannot continue without active profile!");
+    delay(5000);
+    return;
+  }
+
+  if (!isActive) {
+    Serial.println("No active plant profile!");
+    delay(5000);
+    return;
+  }
+
+  sensors.requestTemperatures();
+  float temperature = sensors.getTempCByIndex(0);
+
+  if (temperature == DEVICE_DISCONNECTED_C || temperature == -127.00) {
+    Serial.println("ERROR: DS18B20 temperature sensor not detected!");
+    delay(5000);
+    return;
+  }
+
+  String tempStatus = checkTemperatureStatus(temperature);
+
+  String overallStatus = "OK";
+
+  if (tempStatus == "LOW" || tempStatus == "HIGH") {
+    overallStatus = "WARNING";
+  }
+
+  Serial.println("-------------------------");
+  Serial.print("Plant: ");
+  Serial.println(plantName);
+
+  Serial.print("Temperature: ");
+  Serial.print(temperature, 2);
+  Serial.println(" C");
+
+  Serial.print("Temperature Status: ");
+  Serial.println(tempStatus);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    http.begin(client, systemStatusUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    String json = "{";
+
+    json += "\"activePlant\":\"" + plantName + "\",";
+    json += "\"isActive\":" + String(isActive ? "true" : "false") + ",";
+
+    json += "\"temperature\":" + String(temperature, 2) + ",";
+    json += "\"temperatureStatus\":\"" + tempStatus + "\",";
+
+    json += "\"ph\":null,";
+    json += "\"tds\":null,";
+    json += "\"waterLevel\":null,";
+
+    json += "\"profile\":{";
+    json += "\"phMin\":" + String(phMin, 2) + ",";
+    json += "\"phMax\":" + String(phMax, 2) + ",";
+    json += "\"tdsMin\":" + String(tdsMin, 2) + ",";
+    json += "\"tdsMax\":" + String(tdsMax, 2) + ",";
+    json += "\"tempMin\":" + String(tempMin, 2) + ",";
+    json += "\"tempMax\":" + String(tempMax, 2) + ",";
+    json += "\"wateringCycleHours\":" + String(wateringCycleHours);
+    json += "},";
+
+    json += "\"isFlooding\":null,";
+    json += "\"overallStatus\":\"" + overallStatus + "\",";
+    json += "\"timestamp\":" + String(millis());
+
+    json += "}";
+
+    Serial.print("Sending JSON: ");
+    Serial.println(json);
+
+    int httpResponseCode = http.PUT(json);
+
+    Serial.print("PUT systemStatus Response: ");
+    Serial.println(httpResponseCode);
+
+    String response = http.getString();
+    Serial.print("Firebase Response: ");
+    Serial.println(response);
+
+    http.end();
+  } else {
+    Serial.println("WiFi disconnected!");
+  }
+
+  delay(5000);
+}
