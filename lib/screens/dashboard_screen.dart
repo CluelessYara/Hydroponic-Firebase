@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../providers/auth_provider.dart';
 import '../providers/plant_provider.dart';
 import '../providers/sensor_provider.dart';
 import 'plant_list_screen.dart';
@@ -9,6 +10,7 @@ class DashboardScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final authProvider = context.watch<AppAuthProvider>();
     final plantProvider = context.watch<PlantProvider>();
     final sensorProvider = context.watch<SensorProvider>();
     final plant = plantProvider.activePlant;
@@ -27,6 +29,14 @@ class DashboardScreen extends StatelessWidget {
         title: Text(plant.name),
         actions: [
           IconButton(
+            icon: const Icon(Icons.logout),
+            tooltip: 'Sign out',
+            onPressed: () {
+              // Edited to allow testers to switch Firebase accounts on the same installed app.
+              context.read<AppAuthProvider>().signOut();
+            },
+          ),
+          IconButton(
             icon: const Icon(Icons.list),
             onPressed: () {
               Navigator.push(
@@ -40,7 +50,16 @@ class DashboardScreen extends StatelessWidget {
         ],
       ),
       body: status == null
-          ? const Center(child: CircularProgressIndicator())
+          ? Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  // Edited to show the exact user-scoped RTDB path the ESP32 should write before sensor data exists.
+                  'Waiting for ESP32 sensor data at users/${authProvider.user?.uid}/systemStatus',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            )
           : SingleChildScrollView(
               padding: const EdgeInsets.all(16),
               child: Column(

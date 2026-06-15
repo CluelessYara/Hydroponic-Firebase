@@ -7,6 +7,7 @@ import '../services/firebase_service.dart';
 class SensorProvider extends ChangeNotifier {
   final FirebaseService _firebaseService = FirebaseService();
   StreamSubscription<DatabaseEvent>? _subscription;
+  String? _uid;
 
   SystemStatus? _currentStatus;
   SystemStatus? get currentStatus => _currentStatus;
@@ -14,13 +15,22 @@ class SensorProvider extends ChangeNotifier {
   List<String> _warnings = [];
   List<String> get warnings => _warnings;
 
-  void startListening() {
-    _subscription?.cancel();
+  void startListening(String uid) {
+    if (_uid == uid && _subscription != null) return;
 
-    _subscription = _firebaseService.watchSystemStatus().listen((event) {
+    // Edited to switch the live sensor stream to the signed-in user's systemStatus RTDB branch.
+    _uid = uid;
+    _subscription?.cancel();
+    _currentStatus = null;
+    _warnings = [];
+
+    _subscription = _firebaseService.watchSystemStatus(uid).listen((event) {
       final data = event.snapshot.value;
 
       if (data == null) {
+        _currentStatus = null;
+        _warnings = [];
+        notifyListeners();
         return;
       }
 
@@ -30,8 +40,7 @@ class SensorProvider extends ChangeNotifier {
 
       final warningsRaw = map['warnings'];
       if (warningsRaw is Map) {
-        warningsList =
-            warningsRaw.values.map((e) => e.toString()).toList();
+        warningsList = warningsRaw.values.map((e) => e.toString()).toList();
       } else if (warningsRaw is List) {
         warningsList = warningsRaw.map((e) => e.toString()).toList();
       }
@@ -54,6 +63,8 @@ class SensorProvider extends ChangeNotifier {
   }
 
   void stopListening() {
+    // Edited to clear live data when a user signs out so another user's sensor data is not shown.
+    _uid = null;
     _subscription?.cancel();
     _subscription = null;
     _currentStatus = null;
