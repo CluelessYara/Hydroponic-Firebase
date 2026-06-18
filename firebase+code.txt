@@ -52,6 +52,12 @@ float tempMax = 0;
 
 int wateringCycleHours = 0;
 
+// Edited to keep unavailable sensors from producing false warnings while still letting the app receive numeric fields.
+const bool phSensorEnabled = false;
+const bool tdsSensorEnabled = false;
+const bool waterLevelSensorEnabled = false;
+const float waterLevelMinPercent = 20.0;
+
 String urlEncode(String value) {
   // Edited to safely put Firebase idToken in the REST query string.
   value.replace("%", "%25");
@@ -261,14 +267,53 @@ bool getActiveProfile(bool allowAuthRetry = true) {
   return true;
 }
 
-// Function to check temperature status
-String checkTemperatureStatus(float temperature) {
-  if (temperature < tempMin) {
+String checkRangeStatus(float value, float minValue, float maxValue,
+                        bool sensorEnabled) {
+  // Edited to share exact LOW/HIGH/OK status logic across temperature, pH, and TDS.
+  if (!sensorEnabled) {
+    return "UNAVAILABLE";
+  }
+
+  if (value < minValue) {
     return "LOW";
-  } else if (temperature > tempMax) {
+  } else if (value > maxValue) {
     return "HIGH";
   } else {
     return "OK";
+  }
+}
+
+// Function to check temperature status
+String checkTemperatureStatus(float temperature) {
+  return checkRangeStatus(temperature, tempMin, tempMax, true);
+}
+
+void addRangeWarning(JsonArray warnings, const String& label, float value,
+                     float minValue, float maxValue, const String& unit,
+                     bool sensorEnabled) {
+  // Edited to send detailed warning text so the Flutter app can show the exact parameter problem.
+  if (!sensorEnabled) {
+    return;
+  }
+
+  if (value < minValue) {
+    warnings.add(label + " too low: " + String(value, 2) + unit +
+                 " is below minimum " + String(minValue, 2) + unit + ".");
+  } else if (value > maxValue) {
+    warnings.add(label + " too high: " + String(value, 2) + unit +
+                 " is above maximum " + String(maxValue, 2) + unit + ".");
+  }
+}
+
+void addWaterLevelWarning(JsonArray warnings, float waterLevel) {
+  // Edited to produce a specific low-water warning when a real water-level sensor value is wired in.
+  if (!waterLevelSensorEnabled) {
+    return;
+  }
+
+  if (waterLevel < waterLevelMinPercent) {
+    warnings.add("Water level too low: " + String(waterLevel, 1) +
+                 "% is below minimum " + String(waterLevelMinPercent, 1) + "%.");
   }
 }
 
@@ -298,13 +343,23 @@ bool uploadSystemStatus(float temperature, const String& tempStatus,
   doc["ownerUid"] = firebaseUid;
   doc["isActive"] = isActive;
 
+  float phValue = 0;
+  float tdsValue = 0;
+  float waterLevelValue = 0;
+
+  String phStatus = checkRangeStatus(phValue, phMin, phMax, phSensorEnabled);
+  String tdsStatus = checkRangeStatus(tdsValue, tdsMin, tdsMax, tdsSensorEnabled);
+
   doc["temperature"] = temperature;
   doc["temperatureStatus"] = tempStatus;
 
-  // Edited to send numeric placeholder values instead of null because the Flutter app casts these fields as numbers.
-  doc["ph"] = 0;
-  doc["tds"] = 0;
-  doc["waterLevel"] = 0;
+  // Edited to send numeric placeholders until real pH/TDS/water-level sensors are connected.
+  doc["ph"] = phValue;
+  doc["phStatus"] = phStatus;
+  doc["tds"] = tdsValue;
+  doc["tdsStatus"] = tdsStatus;
+  doc["waterLevel"] = waterLevelValue;
+  doc["waterLevelStatus"] = waterLevelSensorEnabled ? "OK" : "UNAVAILABLE";
 
   JsonObject profile = doc.createNestedObject("profile");
   profile["phMin"] = phMin;
@@ -317,15 +372,16 @@ bool uploadSystemStatus(float temperature, const String& tempStatus,
 
   // Edited to send a boolean placeholder instead of null because the Flutter app casts isFlooding as bool.
   doc["isFlooding"] = false;
-  doc["overallStatus"] = overallStatus;
   doc["timestamp"] = String(millis());
 
   JsonArray warnings = doc.createNestedArray("warnings");
-  if (tempStatus == "LOW") {
-    warnings.add("Temperature is below the active profile minimum.");
-  } else if (tempStatus == "HIGH") {
-    warnings.add("Temperature is above the active profile maximum.");
-  }
+  addRangeWarning(warnings, "Temperature", temperature, tempMin, tempMax, " C", true);
+  addRangeWarning(warnings, "pH", phValue, phMin, phMax, "", phSensorEnabled);
+  addRangeWarning(warnings, "TDS", tdsValue, tdsMin, tdsMax, " ppm", tdsSensorEnabled);
+  addWaterLevelWarning(warnings, waterLevelValue);
+
+  // Edited to keep overallStatus as a summary while the warnings array carries exact problem text.
+  doc["overallStatus"] = warnings.size() > 0 ? "Warning" : overallStatus;
 
   String json;
   serializeJson(doc, json);

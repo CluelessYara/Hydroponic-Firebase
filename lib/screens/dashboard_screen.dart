@@ -64,7 +64,7 @@ class DashboardScreen extends StatelessWidget {
               padding: const EdgeInsets.all(16),
               child: Column(
                 children: [
-                  _statusBanner(status.overallStatus),
+                  _statusBanner(status.overallStatus, sensorProvider.warnings),
                   const SizedBox(height: 16),
 
                   Row(
@@ -198,8 +198,12 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _statusBanner(String status) {
+  Widget _statusBanner(String status, List<String> warnings) {
     final isNormal = status.toLowerCase() == 'normal';
+    // Edited to show the first exact warning in the banner instead of only the generic "Warning" summary.
+    final displayText = !isNormal && warnings.isNotEmpty
+        ? 'System Warning: ${warnings.first}'
+        : 'System Status: $status';
 
     return Container(
       width: double.infinity,
@@ -214,7 +218,7 @@ class DashboardScreen extends StatelessWidget {
         ),
       ),
       child: Text(
-        'System Status: $status',
+        displayText,
         textAlign: TextAlign.center,
         style: TextStyle(
           fontSize: 18,
