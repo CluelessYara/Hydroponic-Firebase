@@ -1,0 +1,1423 @@
+/*
+  Hydroponic ESP32 WROOM - authenticated per-user Firebase controller
+
+  Integrated from the older complete controller while keeping the latest Firebase
+  Authentication and /users/<uid>/... RTDB layout used by the Flutter app.
+
+  Features:
+  - Firebase Email/Password sign-in over REST
+  - Reads /users/<authenticated uid>/activeProfile
+  - Writes /users/<authenticated uid>/systemStatus
+  - DS18B20 temperature sensor
+  - Analog pH sensor with trimmed-mean filtering
+  - Analog TDS sensor with median filtering and temperature compensation
+  - Ultrasonic water-level sensor
+  - SSD1306 OLED display
+  - Active-LOW relay control for flood pump, pH+, pH-, nutrient pump, and heater
+  - Detailed warnings array for the Flutter app home screen
+
+  Required Arduino libraries:
+  - Adafruit GFX Library
+  - Adafruit SSD1306
+  - OneWire
+  - DallasTemperature
+  - ArduinoJson
+*/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ArduinoJson.h>
+#include <math.h>
+
+// ============================================================
+// 1. EDIT THESE VALUES LOCALLY BEFORE UPLOADING
+// ============================================================
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Firebase Auth credentials for the exact app user this ESP32 should serve.
+// Edited to authenticate the ESP32 because the new RTDB rules only allow /users/<uid> access to that same signed-in uid.
+const char* firebaseApiKey = "YOUR_FIREBASE_WEB_API_KEY";
+const char* firebaseEmail = "YOUR_FIREBASE_USER_EMAIL";
+const char* firebasePassword = "YOUR_FIREBASE_USER_PASSWORD";
+
+// Firebase project/database configuration.
+// Edited to keep one database host and build per-user paths after Firebase Auth returns the user's localId/uid.
+const char* firebaseDatabaseHost =
+    "https://hydroponic-system-61a0f-default-rtdb.asia-southeast1.firebasedatabase.app";
+
+// ============================================================
+// 2. UPDATED ESP32 WROOM PIN MAP
+// ============================================================
+#define OLED_SDA_PIN 21
+#define OLED_SCL_PIN 22
+#define TDS_SENSOR_PIN 34       // Analog input only
+#define PH_SENSOR_PIN 35        // Analog input only
+#define ONE_WIRE_BUS 26         // DS18B20 data pin
+#define TRIG_PIN 5              // Ultrasonic trigger
+#define ECHO_PIN 18             // IMPORTANT: keep ECHO at 3.3 V max
+
+// Edited to use the updated relay channel assignments from the current wiring.
+#define FLOOD_RELAY_PIN 15      // IN1: big flood pump
+#define PH_PLUS_RELAY_PIN 16    // IN2: mini pump assigned to pH+
+#define PH_MINUS_RELAY_PIN 17   // IN3: mini pump assigned to pH-
+#define NUTRIENT_RELAY_PIN 0    // IN4: mini pump assigned to nutrients/TDS
+#define HEATER_RELAY_PIN 33     // Existing heater relay pin; change if your heater relay moved
+
+#define RELAY_ON LOW
+#define RELAY_OFF HIGH
+
+// OLED I2C
+#define OLED_ADDRESS 0x3C
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+// ============================================================
+// 3. CONSTANTS AND DEFAULTS
+// ============================================================
+#define TDS_SAMPLE_COUNT 30
+#define PH_SAMPLE_COUNT 10
+#define ADC_REFERENCE_VOLTAGE 3.3f
+#define ADC_MAX_VALUE 4095.0f
+
+const uint32_t SENSOR_READ_INTERVAL_MS = 2000;
+const uint32_t TDS_ANALOG_SAMPLE_INTERVAL_MS = 40;
+const uint32_t PROFILE_FETCH_INTERVAL_MS = 10000;
+const uint32_t FIREBASE_HEARTBEAT_INTERVAL_MS = 60000;
+const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
+const uint32_t OLED_PAGE_INTERVAL_MS = 3000;
+const unsigned long firebaseTokenRefreshMs = 50UL * 60UL * 1000UL;
+
+const int REQUIRED_BAD_READINGS = 2;
+const float TDS_MIN_VALID_VOLTAGE = 0.05f;
+const float PH_MIN_VALID_VOLTAGE = 0.05f;
+const float PH_MAX_VALID_VOLTAGE = 3.25f;
+
+// ============================================================
+// 4. OBJECTS
+// ============================================================
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+bool oledAvailable = false;
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature temperatureSensors(&oneWire);
+WiFiClientSecure client;
+
+// ============================================================
+// 5. FIREBASE AUTH SESSION
+// ============================================================
+// Edited to store idToken and uid so REST requests target /users/<uid> and satisfy authenticated RTDB rules.
+String firebaseIdToken = "";
+String firebaseUid = "";
+unsigned long firebaseAuthTime = 0;
+
+// ============================================================
+// 6. PROFILE CONFIGURATION RECEIVED FROM FIREBASE
+// ============================================================
+struct ProfileConfig {
+  bool isActive = false;
+  String id = "";
+  String name = "Unknown";
+
+  float phMin = 5.8f;
+  float phMax = 6.5f;
+  float tdsMin = 600.0f;
+  float tdsMax = 1000.0f;
+  float tempMin = 20.0f;
+  float tempMax = 24.0f;
+
+  uint32_t wateringCycleMinutes = 360;
+  uint32_t floodDurationMinutes = 10;
+
+  float tankHeightCm = 8.5f;
+  float minimumWaterLevelPercent = 10.0f;
+  float phCalibrationValue = 20.0f;
+
+  uint32_t phDoseMs = 2000;
+  uint32_t tdsDoseMs = 2000;
+  uint32_t mixingDelayMs = 120000;
+};
+
+ProfileConfig profile;
+bool hasValidProfile = false;
+
+// ============================================================
+// 7. SENSOR READINGS
+// ============================================================
+float temperatureC = NAN;
+bool temperatureValid = false;
+
+float phVoltage = 0.0f;
+float phValue = NAN;
+bool phValid = false;
+
+int tdsAnalogBuffer[TDS_SAMPLE_COUNT];
+int tdsAnalogBufferTemp[TDS_SAMPLE_COUNT];
+int tdsBufferIndex = 0;
+float tdsVoltage = 0.0f;
+float tdsValue = NAN;
+bool tdsValid = false;
+
+float waterDistanceCm = NAN;
+float waterLevelCm = NAN;
+float waterLevelPercent = NAN;
+bool waterLevelValid = false;
+
+// ============================================================
+// 8. RELAY STATES AND CONTROL STATE
+// ============================================================
+bool phPlusRelayOn = false;
+bool phMinusRelayOn = false;
+bool nutrientRelayOn = false;
+bool floodRelayOn = false;
+bool heaterRelayOn = false;
+
+bool dosingPulseActive = false;
+uint8_t activeDosingRelayPin = 0;
+String activeDosingPump = "NONE";
+uint32_t dosingPulseStopAtMs = 0;
+bool hasCompletedDose = false;
+String lastCompletedDosingPump = "NONE";
+uint32_t completedDoseCount = 0;
+uint32_t lastDoseEndedAtMs = 0;
+
+int lowPhCount = 0;
+int highPhCount = 0;
+int lowTdsCount = 0;
+
+bool floodScheduleInitialized = false;
+uint32_t nextFloodAtMs = 0;
+uint32_t floodStopAtMs = 0;
+
+// ============================================================
+// 9. TASK TIMERS AND DATABASE STATE
+// ============================================================
+uint32_t lastSensorReadAtMs = 0;
+uint32_t lastTdsAnalogSampleAtMs = 0;
+uint32_t lastProfileFetchAtMs = 0;
+uint32_t lastStatusSendAtMs = 0;
+uint32_t lastWifiRetryAtMs = 0;
+uint32_t lastOledPageSwitchAtMs = 0;
+uint8_t oledPage = 0;
+
+bool statusDirty = true;
+String lastComparableStatusJson = "";
+
+// ============================================================
+// 10. GENERAL HELPERS
+// ============================================================
+bool timeReached(uint32_t now, uint32_t target) {
+  return static_cast<int32_t>(now - target) >= 0;
+}
+
+float roundTo(float value, int decimals) {
+  if (isnan(value)) return value;
+
+  float scale = 1.0f;
+  for (int i = 0; i < decimals; i++) scale *= 10.0f;
+  return roundf(value * scale) / scale;
+}
+
+String boolText(bool value) {
+  return value ? "ON" : "OFF";
+}
+
+String urlEncode(String value) {
+  // Edited to safely put Firebase idToken in the REST query string.
+  value.replace("%", "%25");
+  value.replace(" ", "%20");
+  value.replace("+", "%2B");
+  value.replace("/", "%2F");
+  value.replace("=", "%3D");
+  value.replace(":", "%3A");
+  return value;
+}
+
+String firebasePathUrl(const String& userChildPath, bool silentWrite = false) {
+  // Edited to route every Firebase REST call through the authenticated user's RTDB branch.
+  String url = String(firebaseDatabaseHost) + "/users/" + firebaseUid + "/" +
+               userChildPath + ".json?auth=" + urlEncode(firebaseIdToken);
+  if (silentWrite) {
+    url += "&print=silent";
+  }
+  return url;
+}
+
+String rangeStatus(float value, bool valid, float minimum, float maximum) {
+  if (!valid) return "ERROR";
+  if (value < minimum) return "LOW";
+  if (value > maximum) return "HIGH";
+  return "OK";
+}
+
+String waterStatus() {
+  if (!waterLevelValid) return "ERROR";
+  if (waterLevelPercent < profile.minimumWaterLevelPercent) return "LOW";
+  return "OK";
+}
+
+String overallStatus() {
+  if (!hasValidProfile) return "Waiting for profile";
+  if (!profile.isActive) return "Inactive";
+
+  if (!temperatureValid || !phValid || !tdsValid || !waterLevelValid) {
+    return "Error";
+  }
+
+  if (rangeStatus(temperatureC, temperatureValid, profile.tempMin, profile.tempMax) != "OK" ||
+      rangeStatus(phValue, phValid, profile.phMin, profile.phMax) != "OK" ||
+      rangeStatus(tdsValue, tdsValid, profile.tdsMin, profile.tdsMax) != "OK" ||
+      waterStatus() != "OK") {
+    return "Warning";
+  }
+
+  return "Normal";
+}
+
+float jsonFloatOr(JsonDocument& doc, const char* key, float fallback) {
+  if (doc[key].is<float>() || doc[key].is<int>() || doc[key].is<long>()) {
+    return doc[key].as<float>();
+  }
+  return fallback;
+}
+
+uint32_t jsonUnsignedOr(JsonDocument& doc, const char* key, uint32_t fallback) {
+  if (doc[key].is<unsigned long>() || doc[key].is<unsigned int>() ||
+      doc[key].is<long>() || doc[key].is<int>()) {
+    long value = doc[key].as<long>();
+    return value >= 0 ? static_cast<uint32_t>(value) : fallback;
+  }
+  return fallback;
+}
+
+bool profileRangesAreValid(const ProfileConfig& candidate) {
+  return candidate.phMin < candidate.phMax &&
+         candidate.tdsMin < candidate.tdsMax &&
+         candidate.tempMin < candidate.tempMax &&
+         candidate.tankHeightCm > 0.0f &&
+         candidate.minimumWaterLevelPercent >= 0.0f &&
+         candidate.minimumWaterLevelPercent <= 100.0f;
+}
+
+bool profilesEqual(const ProfileConfig& a, const ProfileConfig& b) {
+  return a.isActive == b.isActive &&
+         a.id == b.id &&
+         a.name == b.name &&
+         fabsf(a.phMin - b.phMin) < 0.001f &&
+         fabsf(a.phMax - b.phMax) < 0.001f &&
+         fabsf(a.tdsMin - b.tdsMin) < 0.001f &&
+         fabsf(a.tdsMax - b.tdsMax) < 0.001f &&
+         fabsf(a.tempMin - b.tempMin) < 0.001f &&
+         fabsf(a.tempMax - b.tempMax) < 0.001f &&
+         a.wateringCycleMinutes == b.wateringCycleMinutes &&
+         a.floodDurationMinutes == b.floodDurationMinutes &&
+         fabsf(a.tankHeightCm - b.tankHeightCm) < 0.001f &&
+         fabsf(a.minimumWaterLevelPercent - b.minimumWaterLevelPercent) < 0.001f &&
+         fabsf(a.phCalibrationValue - b.phCalibrationValue) < 0.001f &&
+         a.phDoseMs == b.phDoseMs &&
+         a.tdsDoseMs == b.tdsDoseMs &&
+         a.mixingDelayMs == b.mixingDelayMs;
+}
+
+// ============================================================
+// 11. FIREBASE AUTH
+// ============================================================
+bool signInToFirebase() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected!");
+    return false;
+  }
+
+  HTTPClient http;
+  String authUrl =
+      "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" +
+      String(firebaseApiKey);
+
+  http.begin(client, authUrl);
+  http.addHeader("Content-Type", "application/json");
+  http.setConnectTimeout(4000);
+  http.setTimeout(6000);
+
+  StaticJsonDocument<384> requestDoc;
+  requestDoc["email"] = firebaseEmail;
+  requestDoc["password"] = firebasePassword;
+  requestDoc["returnSecureToken"] = true;
+
+  String requestBody;
+  serializeJson(requestDoc, requestBody);
+
+  Serial.println();
+  Serial.println("Signing ESP32 into Firebase Auth...");
+
+  int httpResponseCode = http.POST(requestBody);
+  String payload = http.getString();
+  http.end();
+
+  Serial.print("Firebase Auth Response: ");
+  Serial.println(httpResponseCode);
+
+  if (httpResponseCode != 200) {
+    Serial.println("Failed to sign in to Firebase Auth!");
+    Serial.println(payload);
+    return false;
+  }
+
+  StaticJsonDocument<2048> responseDoc;
+  DeserializationError error = deserializeJson(responseDoc, payload);
+
+  if (error) {
+    Serial.print("Firebase Auth JSON parsing failed: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+
+  firebaseIdToken = responseDoc["idToken"].as<String>();
+  firebaseUid = responseDoc["localId"].as<String>();
+  firebaseAuthTime = millis();
+
+  if (firebaseIdToken.length() == 0 || firebaseUid.length() == 0) {
+    Serial.println("Firebase Auth response did not include idToken/localId!");
+    return false;
+  }
+
+  Serial.println("Firebase Auth sign-in successful.");
+  Serial.print("Target Firebase UID: ");
+  Serial.println(firebaseUid);
+  return true;
+}
+
+bool ensureFirebaseAuth() {
+  // Edited to refresh auth before the one-hour Firebase idToken expires.
+  if (firebaseIdToken.length() == 0 || firebaseUid.length() == 0) {
+    return signInToFirebase();
+  }
+
+  if (millis() - firebaseAuthTime > firebaseTokenRefreshMs) {
+    return signInToFirebase();
+  }
+
+  return true;
+}
+
+// ============================================================
+// 12. RELAY HELPERS
+// ============================================================
+void setRelay(uint8_t pin, bool& storedState, bool turnOn) {
+  if (storedState == turnOn) return;
+
+  digitalWrite(pin, turnOn ? RELAY_ON : RELAY_OFF);
+  storedState = turnOn;
+  statusDirty = true;
+}
+
+void setPhPlusRelay(bool on) {
+  setRelay(PH_PLUS_RELAY_PIN, phPlusRelayOn, on);
+}
+
+void setPhMinusRelay(bool on) {
+  setRelay(PH_MINUS_RELAY_PIN, phMinusRelayOn, on);
+}
+
+void setNutrientRelay(bool on) {
+  setRelay(NUTRIENT_RELAY_PIN, nutrientRelayOn, on);
+}
+
+void setFloodRelay(bool on) {
+  setRelay(FLOOD_RELAY_PIN, floodRelayOn, on);
+}
+
+void setHeaterRelay(bool on) {
+  setRelay(HEATER_RELAY_PIN, heaterRelayOn, on);
+}
+
+void stopAllDosingRelays() {
+  setPhPlusRelay(false);
+  setPhMinusRelay(false);
+  setNutrientRelay(false);
+}
+
+void stopAllActuators() {
+  stopAllDosingRelays();
+  setFloodRelay(false);
+  setHeaterRelay(false);
+
+  dosingPulseActive = false;
+  activeDosingRelayPin = 0;
+  activeDosingPump = "NONE";
+}
+
+// ============================================================
+// 13. WIFI
+// ============================================================
+void startWifiConnection() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  lastWifiRetryAtMs = millis();
+
+  Serial.print("Connecting to WiFi");
+  uint32_t startedAt = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi not connected yet. The controller will retry automatically.");
+  }
+}
+
+void maintainWifi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  uint32_t now = millis();
+  if (now - lastWifiRetryAtMs < WIFI_RETRY_INTERVAL_MS) return;
+
+  lastWifiRetryAtMs = now;
+  Serial.println("Retrying WiFi connection...");
+  WiFi.disconnect();
+  WiFi.begin(ssid, password);
+}
+
+// ============================================================
+// 14. TDS SENSOR
+// ============================================================
+int medianOfArray(int values[], int length) {
+  int sorted[TDS_SAMPLE_COUNT];
+  if (length > TDS_SAMPLE_COUNT) length = TDS_SAMPLE_COUNT;
+
+  for (int i = 0; i < length; i++) {
+    sorted[i] = values[i];
+  }
+
+  for (int i = 0; i < length - 1; i++) {
+    for (int j = 0; j < length - i - 1; j++) {
+      if (sorted[j] > sorted[j + 1]) {
+        int temporary = sorted[j];
+        sorted[j] = sorted[j + 1];
+        sorted[j + 1] = temporary;
+      }
+    }
+  }
+
+  if (length % 2 == 1) {
+    return sorted[length / 2];
+  }
+
+  return (sorted[length / 2] + sorted[(length / 2) - 1]) / 2;
+}
+
+void initializeTdsBuffer() {
+  for (int i = 0; i < TDS_SAMPLE_COUNT; i++) {
+    tdsAnalogBuffer[i] = analogRead(TDS_SENSOR_PIN);
+    delay(20);
+  }
+}
+
+void sampleTdsAnalog() {
+  uint32_t now = millis();
+  if (now - lastTdsAnalogSampleAtMs < TDS_ANALOG_SAMPLE_INTERVAL_MS) return;
+
+  lastTdsAnalogSampleAtMs = now;
+  tdsAnalogBuffer[tdsBufferIndex] = analogRead(TDS_SENSOR_PIN);
+  tdsBufferIndex = (tdsBufferIndex + 1) % TDS_SAMPLE_COUNT;
+}
+
+void readTdsSensor() {
+  for (int i = 0; i < TDS_SAMPLE_COUNT; i++) {
+    tdsAnalogBufferTemp[i] = tdsAnalogBuffer[i];
+  }
+
+  int medianAdc = medianOfArray(tdsAnalogBufferTemp, TDS_SAMPLE_COUNT);
+  tdsVoltage = medianAdc * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE;
+
+  float compensationTemperature = temperatureValid ? temperatureC : 25.0f;
+  float compensationCoefficient = 1.0f + 0.02f * (compensationTemperature - 25.0f);
+  float compensationVoltage = tdsVoltage / compensationCoefficient;
+
+  tdsValue = (133.42f * compensationVoltage * compensationVoltage * compensationVoltage
+              - 255.86f * compensationVoltage * compensationVoltage
+              + 857.39f * compensationVoltage) * 0.5f;
+
+  tdsValid = tdsVoltage >= TDS_MIN_VALID_VOLTAGE &&
+             tdsVoltage <= ADC_REFERENCE_VOLTAGE &&
+             tdsValue >= 0.0f;
+}
+
+// ============================================================
+// 15. pH SENSOR
+// ============================================================
+void readPhSensor() {
+  int readings[PH_SAMPLE_COUNT];
+
+  for (int i = 0; i < PH_SAMPLE_COUNT; i++) {
+    readings[i] = analogRead(PH_SENSOR_PIN);
+    delay(20);
+  }
+
+  for (int i = 0; i < PH_SAMPLE_COUNT - 1; i++) {
+    for (int j = i + 1; j < PH_SAMPLE_COUNT; j++) {
+      if (readings[i] > readings[j]) {
+        int temporary = readings[i];
+        readings[i] = readings[j];
+        readings[j] = temporary;
+      }
+    }
+  }
+
+  unsigned long middleSum = 0;
+  for (int i = 2; i < 8; i++) {
+    middleSum += readings[i];
+  }
+
+  float averageAdc = middleSum / 6.0f;
+  phVoltage = averageAdc * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE;
+  phValue = -5.70f * phVoltage + profile.phCalibrationValue;
+
+  phValid = phVoltage >= PH_MIN_VALID_VOLTAGE &&
+            phVoltage <= PH_MAX_VALID_VOLTAGE &&
+            phValue >= 0.0f && phValue <= 14.0f;
+}
+
+// ============================================================
+// 16. TEMPERATURE AND ULTRASONIC SENSORS
+// ============================================================
+void readTemperatureSensor() {
+  temperatureSensors.requestTemperatures();
+  float value = temperatureSensors.getTempCByIndex(0);
+
+  temperatureValid = value != DEVICE_DISCONNECTED_C &&
+                     value > -55.0f && value < 125.0f;
+
+  temperatureC = temperatureValid ? value : NAN;
+}
+
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return NAN;
+
+  return duration * 0.0343f / 2.0f;
+}
+
+void readWaterLevelSensor() {
+  waterDistanceCm = readDistanceCm();
+
+  if (isnan(waterDistanceCm) || profile.tankHeightCm <= 0.0f) {
+    waterLevelValid = false;
+    waterLevelCm = NAN;
+    waterLevelPercent = NAN;
+    return;
+  }
+
+  waterLevelCm = profile.tankHeightCm - waterDistanceCm;
+  if (waterLevelCm < 0.0f) waterLevelCm = 0.0f;
+  if (waterLevelCm > profile.tankHeightCm) waterLevelCm = profile.tankHeightCm;
+
+  waterLevelPercent = waterLevelCm * 100.0f / profile.tankHeightCm;
+  waterLevelValid = true;
+}
+
+// ============================================================
+// 17. ACTUATOR CONTROL
+// ============================================================
+void controlHeater() {
+  if (!hasValidProfile || !profile.isActive || !temperatureValid) {
+    setHeaterRelay(false);
+    return;
+  }
+
+  if (temperatureC < profile.tempMin) {
+    setHeaterRelay(true);
+  } else if (temperatureC > profile.tempMax) {
+    setHeaterRelay(false);
+  }
+}
+
+bool inMixingCooldown(uint32_t now) {
+  return hasCompletedDose && (now - lastDoseEndedAtMs < profile.mixingDelayMs);
+}
+
+void startDosingPulse(uint8_t relayPin, uint32_t durationMs, const String& pumpName) {
+  if (dosingPulseActive) return;
+
+  stopAllDosingRelays();
+
+  if (relayPin == PH_PLUS_RELAY_PIN) setPhPlusRelay(true);
+  if (relayPin == PH_MINUS_RELAY_PIN) setPhMinusRelay(true);
+  if (relayPin == NUTRIENT_RELAY_PIN) setNutrientRelay(true);
+
+  dosingPulseActive = true;
+  activeDosingRelayPin = relayPin;
+  activeDosingPump = pumpName;
+  dosingPulseStopAtMs = millis() + durationMs;
+  statusDirty = true;
+
+  Serial.print("Dosing pump started: ");
+  Serial.println(pumpName);
+}
+
+void updateDosingPulse() {
+  if (!dosingPulseActive) return;
+
+  uint32_t now = millis();
+  if (!timeReached(now, dosingPulseStopAtMs)) return;
+
+  stopAllDosingRelays();
+  dosingPulseActive = false;
+  activeDosingRelayPin = 0;
+  lastCompletedDosingPump = activeDosingPump;
+  completedDoseCount++;
+  activeDosingPump = "NONE";
+  hasCompletedDose = true;
+  lastDoseEndedAtMs = now;
+  statusDirty = true;
+
+  Serial.println("Dosing pulse finished. Mixing cooldown started.");
+}
+
+bool waterLevelSafeForPumps() {
+  return waterLevelValid && waterLevelPercent >= profile.minimumWaterLevelPercent;
+}
+
+void controlDosingPumps() {
+  uint32_t now = millis();
+
+  if (!hasValidProfile || !profile.isActive) {
+    stopAllDosingRelays();
+    lowPhCount = 0;
+    highPhCount = 0;
+    lowTdsCount = 0;
+    return;
+  }
+
+  if (dosingPulseActive || inMixingCooldown(now) || floodRelayOn) return;
+
+  if (!waterLevelSafeForPumps()) {
+    stopAllDosingRelays();
+    lowPhCount = 0;
+    highPhCount = 0;
+    lowTdsCount = 0;
+    return;
+  }
+
+  // Edited to integrate pH+ / pH- dosing logic from the old controller.
+  if (phValid) {
+    if (phValue < profile.phMin) {
+      lowPhCount++;
+      highPhCount = 0;
+    } else if (phValue > profile.phMax) {
+      highPhCount++;
+      lowPhCount = 0;
+    } else {
+      lowPhCount = 0;
+      highPhCount = 0;
+    }
+
+    if (lowPhCount >= REQUIRED_BAD_READINGS) {
+      lowPhCount = 0;
+      highPhCount = 0;
+      lowTdsCount = 0;
+      startDosingPulse(PH_PLUS_RELAY_PIN, profile.phDoseMs, "PH_PLUS");
+      return;
+    }
+
+    if (highPhCount >= REQUIRED_BAD_READINGS) {
+      lowPhCount = 0;
+      highPhCount = 0;
+      lowTdsCount = 0;
+      startDosingPulse(PH_MINUS_RELAY_PIN, profile.phDoseMs, "PH_MINUS");
+      return;
+    }
+  } else {
+    lowPhCount = 0;
+    highPhCount = 0;
+    return;
+  }
+
+  if (phValue < profile.phMin || phValue > profile.phMax) return;
+
+  // Edited to integrate nutrient dosing logic from the old controller.
+  if (!tdsValid) {
+    lowTdsCount = 0;
+    return;
+  }
+
+  if (tdsValue < profile.tdsMin) {
+    lowTdsCount++;
+  } else {
+    lowTdsCount = 0;
+  }
+
+  if (lowTdsCount >= REQUIRED_BAD_READINGS) {
+    lowTdsCount = 0;
+    startDosingPulse(NUTRIENT_RELAY_PIN, profile.tdsDoseMs, "NUTRIENT");
+  }
+}
+
+uint32_t wateringCycleMs() {
+  return profile.wateringCycleMinutes * 60UL * 1000UL;
+}
+
+uint32_t floodDurationMs() {
+  return profile.floodDurationMinutes * 60UL * 1000UL;
+}
+
+void initializeFloodSchedule() {
+  uint32_t cycleMs = wateringCycleMs();
+
+  if (!profile.isActive || cycleMs == 0) {
+    floodScheduleInitialized = false;
+    setFloodRelay(false);
+    return;
+  }
+
+  nextFloodAtMs = millis() + cycleMs;
+  floodScheduleInitialized = true;
+  statusDirty = true;
+
+  Serial.print("Next flood scheduled after ");
+  Serial.print(profile.wateringCycleMinutes);
+  Serial.println(" minute(s).");
+}
+
+void stopFloodingAndStartDrain(uint32_t now) {
+  if (!floodRelayOn) return;
+
+  setFloodRelay(false);
+  nextFloodAtMs = now + wateringCycleMs();
+  floodScheduleInitialized = true;
+  statusDirty = true;
+
+  Serial.println("Flood pump OFF. Natural draining started.");
+}
+
+void startFlooding(uint32_t now) {
+  if (dosingPulseActive || inMixingCooldown(now)) {
+    Serial.println("Flood delayed: dosing or mixing is in progress.");
+    nextFloodAtMs = now + 60000UL;
+    statusDirty = true;
+    return;
+  }
+
+  if (!waterLevelSafeForPumps()) {
+    Serial.println("Flood skipped: water level is too low or ultrasonic reading is invalid.");
+    nextFloodAtMs = now + 60000UL;
+    statusDirty = true;
+    return;
+  }
+
+  setFloodRelay(true);
+  floodStopAtMs = now + floodDurationMs();
+  statusDirty = true;
+
+  Serial.print("Flood pump ON for ");
+  Serial.print(profile.floodDurationMinutes);
+  Serial.println(" minute(s).");
+}
+
+void controlFloodPump() {
+  uint32_t now = millis();
+
+  if (!hasValidProfile || !profile.isActive || wateringCycleMs() == 0) {
+    setFloodRelay(false);
+    floodScheduleInitialized = false;
+    return;
+  }
+
+  // Edited to stop the flood pump if the reservoir becomes unsafe while flooding.
+  if (floodRelayOn && !waterLevelSafeForPumps()) {
+    Serial.println("Flood stopped early: water level is too low or invalid.");
+    stopFloodingAndStartDrain(now);
+    return;
+  }
+
+  if (floodRelayOn) {
+    if (timeReached(now, floodStopAtMs)) {
+      stopFloodingAndStartDrain(now);
+    }
+    return;
+  }
+
+  if (!floodScheduleInitialized) {
+    initializeFloodSchedule();
+    return;
+  }
+
+  if (timeReached(now, nextFloodAtMs)) {
+    startFlooding(now);
+  }
+}
+
+// ============================================================
+// 18. FIREBASE PROFILE READING
+// ============================================================
+bool fetchActiveProfile(bool allowAuthRetry = true) {
+  if (dosingPulseActive) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!ensureFirebaseAuth()) return false;
+
+  HTTPClient http;
+  // Edited to fetch the authenticated user's active profile instead of the old global /activeProfile.
+  String url = firebasePathUrl("activeProfile");
+
+  http.begin(client, url);
+  http.setConnectTimeout(4000);
+  http.setTimeout(6000);
+
+  int responseCode = http.GET();
+  String responseBody = http.getString();
+  http.end();
+
+  if (responseCode == 401 || responseCode == 403) {
+    firebaseIdToken = "";
+    if (allowAuthRetry && ensureFirebaseAuth()) {
+      return fetchActiveProfile(false);
+    }
+    return false;
+  }
+
+  if (responseCode != 200) {
+    Serial.print("GET user activeProfile failed. HTTP code: ");
+    Serial.println(responseCode);
+    if (responseBody.length() > 0) Serial.println(responseBody);
+    return false;
+  }
+
+  if (responseBody == "null" || responseBody.length() == 0) {
+    Serial.println("GET activeProfile returned null for this user.");
+    return false;
+  }
+
+  StaticJsonDocument<2048> doc;
+  DeserializationError error = deserializeJson(doc, responseBody);
+
+  if (error) {
+    Serial.print("Profile JSON parsing failed: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+
+  ProfileConfig updated = profile;
+  updated.isActive = doc["isActive"] | false;
+  updated.id = doc["id"] | "";
+  updated.name = doc["name"] | "Unknown";
+
+  updated.phMin = jsonFloatOr(doc, "phMin", updated.phMin);
+  updated.phMax = jsonFloatOr(doc, "phMax", updated.phMax);
+  updated.tdsMin = jsonFloatOr(doc, "tdsMin", updated.tdsMin);
+  updated.tdsMax = jsonFloatOr(doc, "tdsMax", updated.tdsMax);
+  updated.tempMin = jsonFloatOr(doc, "tempMin", updated.tempMin);
+  updated.tempMax = jsonFloatOr(doc, "tempMax", updated.tempMax);
+
+  if (!doc["wateringCycleMinutes"].isNull()) {
+    updated.wateringCycleMinutes = jsonUnsignedOr(doc, "wateringCycleMinutes", updated.wateringCycleMinutes);
+  } else if (!doc["wateringCycleHours"].isNull()) {
+    updated.wateringCycleMinutes = jsonUnsignedOr(doc, "wateringCycleHours", 0) * 60UL;
+  }
+
+  updated.floodDurationMinutes = jsonUnsignedOr(doc, "floodDurationMinutes", updated.floodDurationMinutes);
+  updated.tankHeightCm = jsonFloatOr(doc, "tankHeightCm", updated.tankHeightCm);
+  updated.minimumWaterLevelPercent = jsonFloatOr(doc, "minimumWaterLevelPercent", updated.minimumWaterLevelPercent);
+  updated.phCalibrationValue = jsonFloatOr(doc, "phCalibrationValue", updated.phCalibrationValue);
+
+  updated.phDoseMs = jsonUnsignedOr(doc, "phDoseSeconds", updated.phDoseMs / 1000UL) * 1000UL;
+  updated.tdsDoseMs = jsonUnsignedOr(doc, "tdsDoseSeconds", updated.tdsDoseMs / 1000UL) * 1000UL;
+  updated.mixingDelayMs = jsonUnsignedOr(doc, "mixingDelaySeconds", updated.mixingDelayMs / 1000UL) * 1000UL;
+
+  if (!profileRangesAreValid(updated)) {
+    Serial.println("Profile rejected: invalid minimum/maximum range or tank settings.");
+    return false;
+  }
+
+  bool configChanged = !hasValidProfile || !profilesEqual(updated, profile);
+  bool scheduleChanged = !hasValidProfile ||
+                         updated.wateringCycleMinutes != profile.wateringCycleMinutes ||
+                         updated.floodDurationMinutes != profile.floodDurationMinutes ||
+                         updated.isActive != profile.isActive;
+
+  profile = updated;
+  hasValidProfile = true;
+  if (configChanged) statusDirty = true;
+
+  if (!profile.isActive) {
+    stopAllActuators();
+    floodScheduleInitialized = false;
+  } else if (scheduleChanged) {
+    initializeFloodSchedule();
+  }
+
+  Serial.print("Profile loaded: ");
+  Serial.print(profile.name);
+  Serial.print(" | active=");
+  Serial.print(profile.isActive ? "true" : "false");
+  Serial.print(" | flood every ");
+  Serial.print(profile.wateringCycleMinutes);
+  Serial.print(" min for ");
+  Serial.print(profile.floodDurationMinutes);
+  Serial.println(" min");
+
+  return true;
+}
+
+// ============================================================
+// 19. FIREBASE STATUS WRITING + WARNINGS
+// ============================================================
+void addRoundedSensorValues(StaticJsonDocument<4096>& doc) {
+  // Edited to always send numeric fields that the Flutter app casts as numbers, while reporting validity separately.
+  doc["temperature"] = temperatureValid ? roundTo(temperatureC, 1) : 0;
+  doc["ph"] = phValid ? roundTo(phValue, 2) : 0;
+  doc["tds"] = tdsValid ? roundTo(tdsValue / 5.0f, 0) * 5.0f : 0;
+
+  if (waterLevelValid) {
+    doc["waterLevel"] = roundTo(waterLevelPercent, 0);
+    doc["waterLevelPercent"] = roundTo(waterLevelPercent, 0);
+    doc["waterLevelCm"] = roundTo(waterLevelCm, 1);
+    doc["waterDistanceCm"] = roundTo(waterDistanceCm, 1);
+  } else {
+    doc["waterLevel"] = 0;
+    doc["waterLevelPercent"] = 0;
+    doc["waterLevelCm"] = 0;
+    doc["waterDistanceCm"] = 0;
+  }
+}
+
+void addRangeWarning(JsonArray warnings, const String& label, float value,
+                     bool valid, float minValue, float maxValue,
+                     const String& unit) {
+  // Edited to send detailed warning text so the Flutter app can show the exact parameter problem.
+  if (!valid) {
+    warnings.add(label + " sensor error: reading is unavailable or out of valid range.");
+    return;
+  }
+
+  if (value < minValue) {
+    warnings.add(label + " too low: " + String(value, 2) + unit +
+                 " is below minimum " + String(minValue, 2) + unit + ".");
+  } else if (value > maxValue) {
+    warnings.add(label + " too high: " + String(value, 2) + unit +
+                 " is above maximum " + String(maxValue, 2) + unit + ".");
+  }
+}
+
+void addWaterWarning(JsonArray warnings) {
+  if (!waterLevelValid) {
+    warnings.add("Water level sensor error: ultrasonic reading is unavailable.");
+    return;
+  }
+
+  if (waterLevelPercent < profile.minimumWaterLevelPercent) {
+    warnings.add("Water level too low: " + String(waterLevelPercent, 1) +
+                 "% is below minimum " + String(profile.minimumWaterLevelPercent, 1) + "%.");
+  }
+}
+
+void addActuatorWarnings(JsonArray warnings) {
+  if (dosingPulseActive) {
+    warnings.add("Dosing pump active: " + activeDosingPump + " is running.");
+  }
+
+  if (inMixingCooldown(millis())) {
+    warnings.add("Mixing cooldown active after " + lastCompletedDosingPump + " dose.");
+  }
+
+  if (floodRelayOn) {
+    warnings.add("Flood pump active: ebb-and-flow cycle is currently flooding.");
+  }
+
+  if (heaterRelayOn) {
+    warnings.add("Heater active: water temperature is below target range.");
+  }
+}
+
+String buildStatusJson(bool includeChangingMetadata) {
+  StaticJsonDocument<4096> doc;
+
+  doc["activePlant"] = profile.name;
+  doc["activeProfileId"] = profile.id;
+  doc["ownerUid"] = firebaseUid;
+  doc["isActive"] = hasValidProfile && profile.isActive;
+
+  addRoundedSensorValues(doc);
+
+  doc["temperatureStatus"] = rangeStatus(temperatureC, temperatureValid, profile.tempMin, profile.tempMax);
+  doc["phStatus"] = rangeStatus(phValue, phValid, profile.phMin, profile.phMax);
+  doc["tdsStatus"] = rangeStatus(tdsValue, tdsValid, profile.tdsMin, profile.tdsMax);
+  doc["waterLevelStatus"] = waterStatus();
+
+  doc["isFlooding"] = floodRelayOn;
+  doc["isDraining"] = !floodRelayOn;
+
+  JsonArray warnings = doc.createNestedArray("warnings");
+  if (!hasValidProfile) {
+    warnings.add("No valid active profile has been loaded for this user.");
+  } else if (!profile.isActive) {
+    warnings.add("The selected profile is inactive.");
+  } else {
+    addRangeWarning(warnings, "Temperature", temperatureC, temperatureValid, profile.tempMin, profile.tempMax, " C");
+    addRangeWarning(warnings, "pH", phValue, phValid, profile.phMin, profile.phMax, "");
+    addRangeWarning(warnings, "TDS", tdsValue, tdsValid, profile.tdsMin, profile.tdsMax, " ppm");
+    addWaterWarning(warnings);
+    addActuatorWarnings(warnings);
+  }
+
+  // Edited to keep overallStatus as the summary while warnings carries exact problem text.
+  doc["overallStatus"] = warnings.size() > 0 ? overallStatus() : "Normal";
+
+  JsonObject relays = doc.createNestedObject("relays");
+  relays["phPlusPump"] = phPlusRelayOn;
+  relays["phMinusPump"] = phMinusRelayOn;
+  relays["nutrientPump"] = nutrientRelayOn;
+  relays["floodPump"] = floodRelayOn;
+  relays["heater"] = heaterRelayOn;
+
+  JsonObject dosing = doc.createNestedObject("dosing");
+  dosing["active"] = dosingPulseActive;
+  dosing["activePump"] = activeDosingPump;
+  dosing["mixingCooldown"] = inMixingCooldown(millis());
+  dosing["lastCompletedPump"] = lastCompletedDosingPump;
+  dosing["completedDoseCount"] = completedDoseCount;
+  dosing["lastDoseEndedAtUptimeMs"] = hasCompletedDose ? lastDoseEndedAtMs : 0;
+
+  JsonObject errors = doc.createNestedObject("sensorErrors");
+  errors["temperature"] = !temperatureValid;
+  errors["ph"] = !phValid;
+  errors["tds"] = !tdsValid;
+  errors["waterLevel"] = !waterLevelValid;
+
+  JsonObject usedProfile = doc.createNestedObject("profile");
+  usedProfile["phMin"] = profile.phMin;
+  usedProfile["phMax"] = profile.phMax;
+  usedProfile["tdsMin"] = profile.tdsMin;
+  usedProfile["tdsMax"] = profile.tdsMax;
+  usedProfile["tempMin"] = profile.tempMin;
+  usedProfile["tempMax"] = profile.tempMax;
+  usedProfile["wateringCycleMinutes"] = profile.wateringCycleMinutes;
+  usedProfile["floodDurationMinutes"] = profile.floodDurationMinutes;
+  usedProfile["tankHeightCm"] = profile.tankHeightCm;
+  usedProfile["minimumWaterLevelPercent"] = profile.minimumWaterLevelPercent;
+
+  doc["nextFloodAtUptimeMs"] = (floodScheduleInitialized && !floodRelayOn) ? nextFloodAtMs : 0;
+  doc["wifiConnected"] = WiFi.status() == WL_CONNECTED;
+  doc["wifiRssi"] = WiFi.status() == WL_CONNECTED ? static_cast<int>(roundf(WiFi.RSSI() / 5.0f) * 5.0f) : 0;
+
+  if (includeChangingMetadata) {
+    uint32_t now = millis();
+    doc["uptimeMs"] = now;
+    doc["timestamp"] = String(now);
+
+    if (floodScheduleInitialized && !floodRelayOn) {
+      uint32_t secondsRemaining = timeReached(now, nextFloodAtMs) ? 0 : (nextFloodAtMs - now) / 1000UL;
+      doc["nextFloodInSeconds"] = secondsRemaining;
+    } else {
+      doc["nextFloodInSeconds"] = 0;
+    }
+  } else {
+    doc["timestamp"] = String(millis());
+  }
+
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+bool sendStatusIfNeeded(bool force = false, bool allowAuthRetry = true) {
+  if (dosingPulseActive) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!ensureFirebaseAuth()) return false;
+
+  uint32_t now = millis();
+  String comparableJson = buildStatusJson(false);
+
+  bool heartbeatDue = now - lastStatusSendAtMs >= FIREBASE_HEARTBEAT_INTERVAL_MS;
+  bool valuesChanged = comparableJson != lastComparableStatusJson;
+
+  if (!force && !statusDirty && !heartbeatDue && !valuesChanged) return false;
+
+  String payload = buildStatusJson(true);
+  String url = firebasePathUrl("systemStatus", true);
+
+  HTTPClient http;
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.setConnectTimeout(4000);
+  http.setTimeout(6000);
+
+  int responseCode = http.PUT(payload);
+  String responseBody = http.getString();
+  http.end();
+
+  if (responseCode == 401 || responseCode == 403) {
+    firebaseIdToken = "";
+    if (allowAuthRetry && ensureFirebaseAuth()) {
+      return sendStatusIfNeeded(force, false);
+    }
+  }
+
+  if (responseCode == 200 || responseCode == 204) {
+    lastComparableStatusJson = comparableJson;
+    lastStatusSendAtMs = now;
+    statusDirty = false;
+
+    Serial.print("Firebase user-scoped status updated. HTTP code: ");
+    Serial.println(responseCode);
+    return true;
+  }
+
+  Serial.print("PUT user systemStatus failed. HTTP code: ");
+  Serial.println(responseCode);
+  if (responseBody.length() > 0) Serial.println(responseBody);
+  return false;
+}
+
+// ============================================================
+// 20. OLED
+// ============================================================
+void printValueOrError(float value, bool valid, int decimals) {
+  if (valid) display.print(value, decimals);
+  else display.print("ERR");
+}
+
+void drawReadingsPage() {
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("Temp: ");
+  printValueOrError(temperatureC, temperatureValid, 1);
+  display.print(" C H:");
+  display.print(heaterRelayOn ? "ON" : "OFF");
+
+  display.setCursor(0, 16);
+  display.print("pH:   ");
+  printValueOrError(phValue, phValid, 2);
+
+  display.setCursor(0, 32);
+  display.print("TDS:  ");
+  if (tdsValid) {
+    display.print(static_cast<int>(tdsValue));
+    display.print(" ppm");
+  } else {
+    display.print("ERR");
+  }
+
+  display.setCursor(0, 48);
+  display.print("Lvl: ");
+  if (waterLevelValid) {
+    display.print(waterLevelCm, 1);
+    display.print("cm ");
+    display.print(waterLevelPercent, 0);
+    display.print("%");
+  } else {
+    display.print("ERR");
+  }
+}
+
+void drawRelaysPage() {
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("PH+: ");
+  display.print(boolText(phPlusRelayOn));
+  display.print(" PH-: ");
+  display.print(boolText(phMinusRelayOn));
+
+  display.setCursor(0, 16);
+  display.print("Nutrient: ");
+  display.print(boolText(nutrientRelayOn));
+
+  display.setCursor(0, 32);
+  display.print("Flood: ");
+  display.print(boolText(floodRelayOn));
+  display.print(" Heat: ");
+  display.print(boolText(heaterRelayOn));
+
+  display.setCursor(0, 48);
+  display.print("WiFi:");
+  display.print(WiFi.status() == WL_CONNECTED ? "OK " : "NO ");
+  display.print(profile.isActive ? "Active" : "Inactive");
+}
+
+void updateOled() {
+  if (!oledAvailable) return;
+
+  uint32_t now = millis();
+
+  if (now - lastOledPageSwitchAtMs >= OLED_PAGE_INTERVAL_MS) {
+    lastOledPageSwitchAtMs = now;
+    oledPage = (oledPage + 1) % 2;
+  }
+
+  display.clearDisplay();
+
+  if (oledPage == 0) drawReadingsPage();
+  else drawRelaysPage();
+
+  display.display();
+}
+
+// ============================================================
+// 21. SERIAL OUTPUT
+// ============================================================
+void printReadingsToSerial() {
+  Serial.println("================ Hydroponic Status ================");
+  Serial.print("Firebase UID: ");
+  Serial.println(firebaseUid);
+  Serial.print("Plant: ");
+  Serial.print(profile.name);
+  Serial.print(" | active: ");
+  Serial.println(profile.isActive ? "true" : "false");
+
+  Serial.print("Temperature: ");
+  if (temperatureValid) Serial.print(temperatureC, 2);
+  else Serial.print("ERROR");
+  Serial.print(" C | heater: ");
+  Serial.println(boolText(heaterRelayOn));
+
+  Serial.print("pH: ");
+  if (phValid) Serial.print(phValue, 2);
+  else Serial.print("ERROR");
+  Serial.print(" | pH+: ");
+  Serial.print(boolText(phPlusRelayOn));
+  Serial.print(" | pH-: ");
+  Serial.println(boolText(phMinusRelayOn));
+
+  Serial.print("TDS: ");
+  if (tdsValid) Serial.print(tdsValue, 0);
+  else Serial.print("ERROR");
+  Serial.print(" ppm | nutrient: ");
+  Serial.println(boolText(nutrientRelayOn));
+
+  Serial.print("Water: ");
+  if (waterLevelValid) {
+    Serial.print(waterLevelCm, 1);
+    Serial.print(" cm | ");
+    Serial.print(waterLevelPercent, 0);
+    Serial.print(" %");
+  } else {
+    Serial.print("ERROR");
+  }
+  Serial.print(" | flood: ");
+  Serial.println(boolText(floodRelayOn));
+
+  Serial.print("Overall status: ");
+  Serial.println(overallStatus());
+  Serial.println("====================================================");
+}
+
+// ============================================================
+// 22. PERIODIC SENSOR TASK
+// ============================================================
+void readSensorsAndRunControls() {
+  readTemperatureSensor();
+  readPhSensor();
+  readTdsSensor();
+  readWaterLevelSensor();
+
+  controlHeater();
+  controlFloodPump();
+  controlDosingPumps();
+
+  printReadingsToSerial();
+  updateOled();
+}
+
+// ============================================================
+// 23. SETUP AND LOOP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println();
+  Serial.println("Starting Hydroponic ESP32 Controller...");
+
+  // Configure relay outputs first, then force safe OFF state.
+  pinMode(PH_PLUS_RELAY_PIN, OUTPUT);
+  pinMode(PH_MINUS_RELAY_PIN, OUTPUT);
+  pinMode(NUTRIENT_RELAY_PIN, OUTPUT);
+  pinMode(FLOOD_RELAY_PIN, OUTPUT);
+  pinMode(HEATER_RELAY_PIN, OUTPUT);
+
+  digitalWrite(PH_PLUS_RELAY_PIN, RELAY_OFF);
+  digitalWrite(PH_MINUS_RELAY_PIN, RELAY_OFF);
+  digitalWrite(NUTRIENT_RELAY_PIN, RELAY_OFF);
+  digitalWrite(FLOOD_RELAY_PIN, RELAY_OFF);
+  digitalWrite(HEATER_RELAY_PIN, RELAY_OFF);
+
+  pinMode(TDS_SENSOR_PIN, INPUT);
+  pinMode(PH_SENSOR_PIN, INPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(TDS_SENSOR_PIN, ADC_11db);
+  analogSetPinAttenuation(PH_SENSOR_PIN, ADC_11db);
+
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println("OLED not found. Check wiring or try OLED address 0x3D.");
+  } else {
+    oledAvailable = true;
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 20);
+    display.println("Hydroponic system");
+    display.setCursor(0, 36);
+    display.println("Starting...");
+    display.display();
+  }
+
+  temperatureSensors.begin();
+  initializeTdsBuffer();
+
+  client.setInsecure(); // Testing shortcut. Prefer a CA certificate in production.
+  startWifiConnection();
+  ensureFirebaseAuth();
+
+  fetchActiveProfile();
+  readSensorsAndRunControls();
+  sendStatusIfNeeded(true);
+}
+
+void loop() {
+  uint32_t now = millis();
+
+  maintainWifi();
+  sampleTdsAnalog();
+  updateDosingPulse();
+  controlFloodPump();
+
+  if (now - lastProfileFetchAtMs >= PROFILE_FETCH_INTERVAL_MS) {
+    lastProfileFetchAtMs = now;
+    fetchActiveProfile();
+  }
+
+  if (!dosingPulseActive && now - lastSensorReadAtMs >= SENSOR_READ_INTERVAL_MS) {
+    lastSensorReadAtMs = now;
+    readSensorsAndRunControls();
+  }
+
+  updateOled();
+  sendStatusIfNeeded();
+
+  delay(5);
+}

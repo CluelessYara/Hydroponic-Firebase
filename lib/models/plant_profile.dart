@@ -1,5 +1,6 @@
 class PlantProfile {
-  final int? id;
+  // Edited to use String ids because Firebase RTDB push keys are strings and must sync across devices.
+  final String? id;
   final String name;
   final double phMin;
   final double phMax;
@@ -38,23 +39,57 @@ class PlantProfile {
     };
   }
 
+  // Edited to store booleans naturally in Firebase while keeping the old local SQLite map available.
+  Map<String, dynamic> toRealtimeDatabaseMap() {
+    return {
+      'name': name,
+      'phMin': phMin,
+      'phMax': phMax,
+      'tempMin': tempMin,
+      'tempMax': tempMax,
+      'tdsMin': tdsMin,
+      'tdsMax': tdsMax,
+      'wateringCycleHours': wateringCycleHours,
+      'isActive': isActive,
+      'updatedAt': DateTime.now().toIso8601String(),
+    };
+  }
+
   factory PlantProfile.fromMap(Map<String, dynamic> map) {
     return PlantProfile(
-      id: map['id'],
-      name: map['name'],
+      // Edited to safely accept both legacy integer ids and Firebase string ids during migration.
+      id: map['id']?.toString(),
+      name: map['name']?.toString() ?? '',
       phMin: (map['phMin'] as num).toDouble(),
       phMax: (map['phMax'] as num).toDouble(),
       tempMin: (map['tempMin'] as num).toDouble(),
       tempMax: (map['tempMax'] as num).toDouble(),
       tdsMin: (map['tdsMin'] as num).toDouble(),
       tdsMax: (map['tdsMax'] as num).toDouble(),
-      wateringCycleHours: map['wateringCycleHours'],
-      isActive: map['isActive'] == 1,
+      wateringCycleHours: (map['wateringCycleHours'] as num).toInt(),
+      // Edited to read either Firebase bools or legacy SQLite integer flags.
+      isActive: map['isActive'] == true || map['isActive'] == 1,
     );
   }
 
+  // Edited to rebuild Firebase list entries from their RTDB key plus the saved profile values.
+  factory PlantProfile.fromRealtimeDatabase(String id, Map<dynamic, dynamic> map) {
+    return PlantProfile.fromMap({
+      'id': id,
+      'name': map['name'],
+      'phMin': map['phMin'],
+      'phMax': map['phMax'],
+      'tempMin': map['tempMin'],
+      'tempMax': map['tempMax'],
+      'tdsMin': map['tdsMin'],
+      'tdsMax': map['tdsMax'],
+      'wateringCycleHours': map['wateringCycleHours'],
+      'isActive': map['isActive'],
+    });
+  }
+
   PlantProfile copyWith({
-    int? id,
+    String? id,
     String? name,
     double? phMin,
     double? phMax,
