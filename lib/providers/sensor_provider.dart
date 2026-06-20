@@ -5,7 +5,9 @@ import '../models/system_status.dart';
 import '../services/firebase_service.dart';
 
 class SensorProvider extends ChangeNotifier {
-  final FirebaseService _firebaseService = FirebaseService();
+  SensorProvider({required String uid}) : _firebaseService = FirebaseService(uid: uid);
+
+  final FirebaseService _firebaseService;
   StreamSubscription<DatabaseEvent>? _subscription;
 
   SystemStatus? _currentStatus;
@@ -21,6 +23,9 @@ class SensorProvider extends ChangeNotifier {
       final data = event.snapshot.value;
 
       if (data == null) {
+        _currentStatus = null;
+        _warnings = [];
+        notifyListeners();
         return;
       }
 
@@ -30,8 +35,7 @@ class SensorProvider extends ChangeNotifier {
 
       final warningsRaw = map['warnings'];
       if (warningsRaw is Map) {
-        warningsList =
-            warningsRaw.values.map((e) => e.toString()).toList();
+        warningsList = warningsRaw.values.map((e) => e.toString()).toList();
       } else if (warningsRaw is List) {
         warningsList = warningsRaw.map((e) => e.toString()).toList();
       }

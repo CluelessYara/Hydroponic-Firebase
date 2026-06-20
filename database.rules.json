@@ -1,0 +1,21 @@
+{
+  "rules": {
+    "users": {
+      "$uid": {
+        ".read": "auth != null && auth.uid == $uid",
+        ".write": "auth != null && auth.uid == $uid",
+        "plantProfiles": {
+          "$profileId": {
+            ".validate": "newData.hasChildren(['name', 'phMin', 'phMax', 'tempMin', 'tempMax', 'tdsMin', 'tdsMax', 'wateringCycleHours', 'isActive'])"
+          }
+        },
+        "activeProfile": {
+          ".validate": "newData.hasChildren(['id', 'name', 'phMin', 'phMax', 'tempMin', 'tempMax', 'tdsMin', 'tdsMax', 'wateringCycleHours', 'isActive', 'ownerUid'])"
+        },
+        "systemStatus": {
+          ".validate": "newData.hasChildren(['ph', 'temperature', 'tds', 'waterLevel', 'isFlooding', 'timestamp', 'overallStatus'])"
+        }
+      }
+    }
+  }
+}

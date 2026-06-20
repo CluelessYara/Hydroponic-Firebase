@@ -20,11 +20,11 @@ class DatabaseService {
 
     return await openDatabase(
       path,
-      version: 2,
+      version: 3,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE plant_profiles(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             phMin REAL NOT NULL,
             phMax REAL NOT NULL,
@@ -41,7 +41,7 @@ class DatabaseService {
         await db.execute('DROP TABLE IF EXISTS plant_profiles');
         await db.execute('''
           CREATE TABLE plant_profiles(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             phMin REAL NOT NULL,
             phMax REAL NOT NULL,
@@ -59,7 +59,7 @@ class DatabaseService {
 
   Future<int> insertPlant(PlantProfile plant) async {
     final db = await database;
-    return db.insert('plant_profiles', plant.toMap());
+    return db.insert('plant_profiles', _toLocalMap(plant));
   }
 
   Future<List<PlantProfile>> getPlants() async {
@@ -68,7 +68,7 @@ class DatabaseService {
     return maps.map((map) => PlantProfile.fromMap(map)).toList();
   }
 
-  Future<void> setActivePlant(int id) async {
+  Future<void> setActivePlant(String id) async {
     final db = await database;
     await db.update('plant_profiles', {'isActive': 0});
     await db.update(
@@ -83,18 +83,25 @@ class DatabaseService {
     final db = await database;
     await db.update(
       'plant_profiles',
-      plant.toMap(),
+      _toLocalMap(plant),
       where: 'id = ?',
       whereArgs: [plant.id],
     );
   }
 
-  Future<void> deletePlant(int id) async {
+  Future<void> deletePlant(String id) async {
     final db = await database;
     await db.delete(
       'plant_profiles',
       where: 'id = ?',
       whereArgs: [id],
     );
+  }
+
+  Map<String, dynamic> _toLocalMap(PlantProfile plant) {
+    return {
+      ...plant.toMap(),
+      'isActive': plant.isActive ? 1 : 0,
+    };
   }
 }
